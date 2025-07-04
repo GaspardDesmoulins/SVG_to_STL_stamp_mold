@@ -1,2 +1,24 @@
 # SVG_to_STL_stamp_mold
+
 A python utility to convert a SVG into a 3d printable silicon stamp mold
+
+## Vs Code debug configuration
+
+```JSON
+    {
+      "name": "Débogueur Python : Fichier chat STL",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "args": [
+        "--svg",
+        "le_chat.svg",
+        "--size",
+        "40",
+        "--output",
+        "moule_chat.stl",
+        "--export-steps"
+      ],
+      "console": "integratedTerminal"
+    }
+```
