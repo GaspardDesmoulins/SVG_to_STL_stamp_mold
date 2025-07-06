@@ -8,6 +8,7 @@ import re
 import argparse
 from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon
+import math
 
 
 # === Paramètres du moule ===
@@ -158,9 +159,10 @@ def filter_points(points):
     return filtered
 
 
-def svg_to_cadquery_wires(svg_file, max_dimension, interactive=True):
+def svg_to_cadquery_wires(svg_file, max_dimension, interactive=True, force_all_contours=False):
     """
     Convertit un SVG en wires CadQuery, avec simplification et gestion de l'échelle.
+    Peut forcer l'extraction de tous les contours (utile pour les SVG Affinity Designer).
     Retourne la liste des wires et l'historique des shapes.
     """
     svgfile = Path(svg_file)
@@ -173,9 +175,22 @@ def svg_to_cadquery_wires(svg_file, max_dimension, interactive=True):
     shape_keys = []
     wire_to_shape = {}
 
+    def is_visible(attr):
+        # Détermine si un élément doit être extrait (fill ou stroke visible, ou extraction forcée)
+        if force_all_contours:
+            return True
+        fill = attr.get('fill', None)
+        stroke = attr.get('stroke', None)
+        # On considère visible si fill n'est pas none/transparent OU stroke n'est pas none/transparent
+        def is_none_or_transparent(val):
+            if val is None:
+                return False  # Si absent, on considère visible
+            val = val.strip().lower()
+            return val in ['none', 'transparent']
+        return not (is_none_or_transparent(fill) and is_none_or_transparent(stroke))
+
     for path_idx, (path, attr) in enumerate(zip(paths, attributes)):
-        fill = attr.get('fill', 'none')
-        if fill in ['none', 'transparent']:
+        if not is_visible(attr):
             continue
         print(f"\n--- Path {path_idx} ---")
         subpaths = extract_subpaths(path, sampling_default)
@@ -195,8 +210,56 @@ def svg_to_cadquery_wires(svg_file, max_dimension, interactive=True):
                     'cq_wire_index': None,
                 }
 
+    # --- Ajout du support des ellipses SVG ---
+    tree = ET.parse(str(svgfile.absolute()))
+    root = tree.getroot()
+    ellipse_count = 0
+    for elem in root.iter():
+        if strip_namespace(elem.tag) == 'ellipse':
+            try:
+                # On récupère les attributs SVG (fill, stroke, etc.)
+                fill = elem.attrib.get('fill', None)
+                stroke = elem.attrib.get('stroke', None)
+                if not force_all_contours:
+                    def is_none_or_transparent(val):
+                        if val is None:
+                            return False
+                        val = val.strip().lower()
+                        return val in ['none', 'transparent']
+                    if is_none_or_transparent(fill) and is_none_or_transparent(stroke):
+                        continue  # Ellipse non visible
+                cx = float(elem.attrib.get('cx', '0'))
+                cy = float(elem.attrib.get('cy', '0'))
+                rx = float(elem.attrib.get('rx', '0'))
+                ry = float(elem.attrib.get('ry', '0'))
+                if rx == 0 or ry == 0:
+                    continue  # Ellipse dégénérée
+                n_pts = 60
+                ellipse_points = []
+                for i in range(n_pts):
+                    theta = 2 * math.pi * i / n_pts
+                    x = cx + rx * math.cos(theta)
+                    y = cy + ry * math.sin(theta)
+                    ellipse_points.append([x, y])
+                ellipse_points.append(ellipse_points[0])  # Fermeture
+                all_points.extend(ellipse_points)
+                shapes_data.append(ellipse_points)
+                ellipse_key = ("ellipse", ellipse_count)
+                shape_keys.append(ellipse_key)
+                shape_history[ellipse_key] = {
+                    'svg_path_idx': "ellipse",
+                    'svg_sub_idx': ellipse_count,
+                    'svg_attr': dict(elem.attrib),
+                    'sampled_points': ellipse_points,
+                    'simplified_points': ellipse_points,
+                    'cq_wire_index': None,
+                }
+                ellipse_count += 1
+            except Exception as e:
+                print(f"Erreur lors de l'extraction d'une ellipse : {e}")
+
     if not all_points:
-        raise ValueError("No SVG paths found with fill to create mold.")
+        raise ValueError("No SVG paths found with fill or stroke to create mold.")
 
     xs = [pt[0] for pt in all_points]
     ys = [pt[1] for pt in all_points]
@@ -410,8 +473,15 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                 face = face_result[0]
             else:
                 face = face_result
-            engraving = cq.Workplane("XY").add(face).extrude(-engrave_depth)
+            # --- Gravure avec dépouille (loft) ---
+            draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
+            engraving = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
+            print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving)}")
+            # si la dépouille échoue, on utilise l'extrusion directe
+            if engraving is None:
+                engraving = cq.Workplane("XY").add(face).extrude(-engrave_depth)
             engravings = flatten_cq_solids(engraving)
+            print(f"[DEBUG] Types des objets retournés par flatten_cq_solids: {[type(e) for e in engravings]}")
             if not engravings:
                 print(f"Warning: Extrusion du groupe {idx} n'a pas produit de solide.")
                 for w in wire_group:
@@ -428,9 +498,19 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                 continue
             success = False
             for engraving_solid in engravings:
-                if engraving_solid.isValid() and engraving_solid.ShapeType() == "Solid":
+                print(f"[DEBUG] engraving_solid type: {type(engraving_solid)}")
+                # Vérifie la présence de isValid()
+                if hasattr(engraving_solid, 'isValid'):
+                    valid = engraving_solid.isValid()
+                else:
+                    valid = False
+                print(f"[DEBUG] engraving_solid.isValid() = {valid}")
+                if valid and hasattr(engraving_solid, 'ShapeType'):
+                    print(f"[DEBUG] engraving_solid.ShapeType() = {engraving_solid.ShapeType()}")
+                if valid and hasattr(engraving_solid, 'ShapeType') and engraving_solid.ShapeType() in ["Solid", "Compound"]:
                     engraving_solid = engraving_solid.translate((0, 0, base_thickness))
                     try:
+                        # Gravure explicite du moule par appel de cut()
                         new_mold = mold.cut(engraving_solid)
                         mold = new_mold
                         success = True
@@ -534,10 +614,13 @@ def flatten_cq_solids(obj):
         solids.append(obj)
     elif hasattr(obj, 'val') and callable(obj.val):
         # Workplane avec un seul objet
-        solids.extend(flatten_cq_solids(obj.val()))
+        val = obj.val()
+        print(f"[flatten_cq_solids] Workplane.val() type: {type(val)}")
+        solids.extend(flatten_cq_solids(val))
     elif hasattr(obj, 'vals') and callable(obj.vals):
         # Workplane avec plusieurs objets
         for v in obj.vals():
+            print(f"[flatten_cq_solids] Workplane.vals() type: {type(v)}")
             solids.extend(flatten_cq_solids(v))
     else:
         print(f"[flatten_cq_solids] Objet ignoré (ni CQ, ni Workplane, ni liste): {type(obj)} -> {obj}")
@@ -613,6 +696,148 @@ def group_wires_by_inclusion(wires, shape_history=None):
             used.add(i)
     return all_groups
 
+def scale_wire_2d(wire, scale_factor):
+    """Retourne une nouvelle wire dilatée/réduite par rapport à son centroïde."""
+    pts = np.array([(v.X, v.Y) for v in wire.Vertices()])
+    centroid = pts.mean(axis=0)
+    scaled_pts = centroid + (pts - centroid) * scale_factor
+    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in scaled_pts])
+
+def offset_polygon_along_normals(points, offset, centroid_dir=1):
+    """
+    Décale chaque point d'un polygone selon la normale locale à la bordure.
+    - points : liste de tuples (x, y) du polygone (doit être fermé ou sera fermé automatiquement)
+    - offset : distance de décalage (positive)
+    - centroid_dir : +1 pour outer (vers l'extérieur du centroïde), -1 pour inner (vers le centroïde)
+    Retourne une nouvelle liste de points décalés.
+    """
+    # Filtre les points dupliqués consécutifs
+    filtered = [points[0]]
+    for p in points[1:]:
+        if np.linalg.norm(np.array(p) - np.array(filtered[-1])) > 1e-10:
+            filtered.append(p)
+    points = filtered
+    pts = np.array(points)
+    if not np.allclose(pts[0], pts[-1]):
+        pts = np.vstack([pts, pts[0]])  # Ferme le polygone si besoin
+    n = len(pts) - 1  # nombre de segments
+    centroid = pts[:-1].mean(axis=0)
+    new_pts = []
+    for i in range(n):
+        p_prev = pts[i - 1]
+        p = pts[i]
+        p_next = pts[(i + 1) % n]
+        # Vecteurs des segments adjacents
+        v1 = p - p_prev
+        v2 = p_next - p
+        # Normales aux segments (sens trigo)
+        n1 = np.array([-v1[1], v1[0]])
+        n2 = np.array([-v2[1], v2[0]])
+        norm1 = np.linalg.norm(n1)
+        norm2 = np.linalg.norm(n2)
+        if norm1 < 1e-10 or norm2 < 1e-10:
+            # Si un segment est nul, saute la normale correspondante
+            normal = n1 if norm2 < 1e-10 else n2
+            if np.linalg.norm(normal) < 1e-10:
+                normal = np.array([1.0, 0.0])  # Valeur par défaut
+        else:
+            n1 /= norm1
+            n2 /= norm2
+            # Normale moyenne au sommet
+            normal = (n1 + n2)
+            if np.linalg.norm(normal) < 1e-8:
+                normal = n1  # Cas angle plat
+            else:
+                normal /= np.linalg.norm(normal)
+        # Sens de la normale (vers l'extérieur ou l'intérieur)
+        to_centroid = centroid - p
+        if np.dot(normal, to_centroid) * centroid_dir > 0:
+            normal = -normal
+        new_p = p + offset * normal
+        new_pts.append(tuple(new_p))
+    # Ferme le polygone
+    new_pts.append(new_pts[0])
+    return new_pts
+
+def get_scaled_wire_from_wire(wire, offset, centroid_dir):
+    """
+    Génère un wire décalé (scaled) à partir d'un wire d'origine, selon la normale locale et un offset.
+    Args:
+        wire (cq.Wire): Wire d'origine
+        offset (float): Distance de décalage
+        centroid_dir (int): +1 pour outer, -1 pour inner
+    Returns:
+        cq.Wire: Wire décalé
+    """
+    wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
+    offset_points = offset_polygon_along_normals(wire_points, offset, centroid_dir=centroid_dir)
+    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in offset_points])
+
+
+def loft_with_draft(wire_group, draft_angle_deg, depth):
+    """
+    Réalise un loft avec dépouille pour chaque wire du groupe (contour principal et éventuels trous).
+    Pour chaque wire (contour) :
+      - Génère un wire décalé selon la normale locale (dépouille)
+      - Fait un loft entre le wire original (en Z bas) et le wire décalé (en Z haut)
+      - Le solide du contour principal (outer) est ajouté, les solides des trous (inners) sont soustraits (cut)
+    Args:
+        wire_group (list): Liste de wires CadQuery (le premier est le contour principal, les suivants sont les trous)
+        draft_angle_deg (float): Angle de dépouille en degrés (positif = évasé)
+        depth (float): Profondeur du motif (positive)
+    Returns:
+        Solid CadQuery résultant du loft avec dépouille, ou None si échec
+    """
+    # Si pas de dépouille ou profondeur nulle, rien à faire
+    if depth == 0 or draft_angle_deg == 0:
+        return None  # Pas de dépouille à appliquer
+    try:
+        # Calcul de l'offset latéral à appliquer selon l'angle de dépouille
+        offset = abs(depth) * math.tan(math.radians(draft_angle_deg))
+        print("[loft_with_draft] Début du loft individuel. Nombre de wires:", len(wire_group))
+        lofted_solids = []
+        # Parcours de chaque wire du groupe (contour principal + trous)
+        for wire_index, wire in enumerate(wire_group):
+            # Sens de l'offset : +1 pour outer, -1 pour inners
+            direction_centroid = 1 if wire_index == 0 else -1
+            # Génération du wire décalé via la fonction dédiée
+            scaled_wire = get_scaled_wire_from_wire(wire, offset, direction_centroid)
+            # Création des faces (top = wire décalé, bottom = wire original)
+            try:
+                face_top = cq.Face.makeFromWires(scaled_wire)
+                face_bottom = cq.Face.makeFromWires(wire)
+            except Exception as e:
+                print(f"[loft_with_draft] Echec de makeFromWires (individuel) : {e}")
+                continue  # Passe au wire suivant si échec
+            # Placement des faces à la bonne hauteur Z
+            face_top = face_top.translate((0, 0, 0))
+            face_bottom = face_bottom.translate((0, 0, -depth))
+            # Création du loft entre les deux faces
+            workplane = cq.Workplane("XY").add([face_top, face_bottom])
+            try:
+                lofted_solid = workplane.loft(combine=True)
+                print(f"[loft_with_draft] Loft individuel réussi pour wire {wire_index}.")
+                lofted_solids.append(lofted_solid)
+            except Exception as e:
+                print(f"[loft_with_draft] Echec du loft individuel pour wire {wire_index}: {e}")
+                continue  # Passe au wire suivant si échec
+        # Combine les solides : outer (index 0) en add, inners (>0) en cut
+        if not lofted_solids:
+            print("[loft_with_draft] Aucun solide généré.")
+            return None
+        # Le premier solide (contour principal) sert de base
+        result_solid = lofted_solids[0]
+        # Les suivants (trous) sont soustraits
+        for inner_solid in lofted_solids[1:]:
+            try:
+                result_solid = result_solid.cut(inner_solid)
+            except Exception as e:
+                print(f"[loft_with_draft] Echec du cut pour inner : {e}")
+        return result_solid
+    except Exception as e:
+        print(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
+        return None
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Génère un moule à silicone depuis un SVG avec CadQuery.")
     parser.add_argument("--svg", help="Chemin du fichier SVG")
@@ -650,7 +875,7 @@ if __name__ == "__main__":
         # Génération du SVG de résumé avec couleurs distinctes
         all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
         if all_shape_keys:
-            generate_summary_svg(args.svg, all_shape_keys, 'summary_polygons.svg', shape_history=shape_history)
+            generate_summary_svg(args.svg, all_shape_keys, f'summary_{args.svg.split("/")[-1]}', shape_history=shape_history)
             print("SVG de résumé généré avec couleurs selon le statut de gravure.")
         else:
             print("Aucun polygone détecté, pas de SVG de visualisation généré.")
