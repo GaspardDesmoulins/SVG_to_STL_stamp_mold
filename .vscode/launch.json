@@ -48,6 +48,22 @@
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"
+    },
+    {
+      "name": "Débogueur Python : Fichier Anneau imbriqués STL",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/svgs/Anneaux_imbriqués.svg",
+        "--size",
+        "40",
+        "--output",
+        "${workspaceFolder}/svgs/moule_anneaux_imbriqués.stl",
+        "--keep-debug-files"
+      ],
+      "console": "integratedTerminal"
     }
   ]
 }
