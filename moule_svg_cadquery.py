@@ -437,51 +437,58 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     # Utiliser le regroupement par path_idx puis inclusion
     grouped_wires = group_wires_by_inclusion(svg_wires, shape_history)
     wire_to_shape = shape_history.get('wire_to_shape', {})
-    for idx, wire_group in enumerate(grouped_wires):
+    for idx, wire_group in grouped_wires:
         try:
             print(f"\n--- Gravure polygone {idx} (groupe de {len(wire_group)} wires) ---")
-            for w_idx, w in enumerate(wire_group):
-                try:
-                    global_wire_index = svg_wires.index(w)
-                except ValueError:
-                    global_wire_index = None
-                shape_info = wire_to_shape.get(global_wire_index, None)
-                if shape_info is not None:
-                    hist = shape_history[shape_info]
-                    print(f"  Wire {w_idx} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
-                else:
-                    print(f"  Wire {w_idx} (global idx {global_wire_index}): [shape SVG non trouvée]")
-                print(f"    isClosed: {w.IsClosed()}, isValid: {w.isValid()}, nb sommets: {len(list(w.Vertices()))}")
-            try:
-                face_result = cq.Face.makeFromWires(wire_group[0], wire_group[1:])
-            except Exception as e:
-                print(f"Erreur makeFromWires sur groupe {idx}: {e}")
-                for w in wire_group:
+            # --- Gravure avec dépouille (loft) ---
+            draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
+            engraving = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
+
+            print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving)}")
+            # si la dépouille échoue, on utilise l'extrusion directe
+            if engraving is None:
+                print(f"[DEBUG] Objet engraving est None, on utilise l'extrusion directe.")
+                # on construit un face à partir des wires du groupe
+                for w_idx, w in enumerate(wire_group):
                     try:
                         global_wire_index = svg_wires.index(w)
                     except ValueError:
                         global_wire_index = None
-                    if global_wire_index is not None:
-                        for shape_key, hist in shape_history.items():
-                            if isinstance(shape_key, tuple) and hist.get('cq_wire_index') == global_wire_index:
-                                hist['engraved'] = False
+                    shape_info = wire_to_shape.get(global_wire_index, None)
+                    if shape_info is not None:
+                        hist = shape_history[shape_info]
+                        print(f"  Wire {w_idx} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
                     else:
-                        print(f"Impossible de trouver le wire: {w} dans svg_wires pour le groupe {idx}.")
-                continue
-            if isinstance(face_result, list):
-                if not face_result:
-                    print(f"Polygone {idx} : makeFromWires a retourné une liste vide.")
+                        print(f"  Wire {w_idx} (global idx {global_wire_index}): [shape SVG non trouvée]")
+                    print(f"    isClosed: {w.IsClosed()}, isValid: {w.isValid()}, nb sommets: {len(list(w.Vertices()))}")
+                try:
+                    face_result = cq.Face.makeFromWires(wire_group[0], wire_group[1:])
+                except Exception as e:
+                    print(f"Erreur makeFromWires sur groupe {idx}: {e}")
+                    for w in wire_group:
+                        try:
+                            global_wire_index = svg_wires.index(w)
+                        except ValueError:
+                            global_wire_index = None
+                        if global_wire_index is not None:
+                            for shape_key, hist in shape_history.items():
+                                if isinstance(shape_key, tuple) and hist.get('cq_wire_index') == global_wire_index:
+                                    hist['engraved'] = False
+                        else:
+                            print(f"Impossible de trouver le wire: {w} dans svg_wires pour le groupe {idx}.")
                     continue
-                face = face_result[0]
-            else:
-                face = face_result
-            # --- Gravure avec dépouille (loft) ---
-            draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
-            engraving = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
-            print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving)}")
-            # si la dépouille échoue, on utilise l'extrusion directe
-            if engraving is None:
+                if isinstance(face_result, list):
+                    if not face_result:
+                        print(f"Polygone {idx} : makeFromWires a retourné une liste vide.")
+                        continue
+                    face = face_result[0]
+                else:
+                    face = face_result
+                
+                #on tente d'extruder la face en extrusion directe
                 engraving = cq.Workplane("XY").add(face).extrude(-engrave_depth)
+
+            # Simplification des solides extrudés
             engravings = flatten_cq_solids(engraving)
             print(f"[DEBUG] Types des objets retournés par flatten_cq_solids: {[type(e) for e in engravings]}")
             if not engravings:
@@ -669,17 +676,17 @@ def group_wires_by_inclusion(wires, shape_history=None):
             pts = [(v.X, v.Y) for v in w.Vertices()]
             wires_polygons.append((w, ShapelyPolygon(pts)))
         used = set()
-        for i, (outer_w, outer_poly) in enumerate(wires_polygons):
-            if i in used:
+        for fake_path_idx, (outer_w, outer_poly) in enumerate(wires_polygons):
+            if fake_path_idx in used:
                 continue  # Ce wire a déjà été utilisé comme inner
             inners = []
             # Recherche de tous les wires strictement inclus dans outer_poly
             for j, (inner_w, inner_poly) in enumerate(wires_polygons):
-                if i != j and outer_poly.contains(inner_poly):
+                if fake_path_idx != j and outer_poly.contains(inner_poly):
                     inners.append(inner_w)
                     used.add(j)
-            grouped.append([outer_w] + inners)
-            used.add(i)
+            grouped.append((fake_path_idx, [outer_w] + inners))
+            used.add(fake_path_idx)
         return grouped
 
     # 1. Regrouper les indices de wires par svg_path_idx
@@ -697,22 +704,40 @@ def group_wires_by_inclusion(wires, shape_history=None):
         wires_in_group = [wires[i] for i in wire_indices]
         # Conversion en polygones Shapely pour inclusion rapide
         wires_polygons = []
-        for w in wires_in_group:
-            pts = [(v.X, v.Y) for v in w.Vertices()]
-            wires_polygons.append((w, ShapelyPolygon(pts)))
+        for wire in wires_in_group:
+            pts = [(v.X, v.Y) for v in wire.Vertices()]
+            wires_polygons.append((wire, ShapelyPolygon(pts)))
+        
+        if len(wires_polygons) == 1:
+            # Si un seul wire, on le retourne comme groupe unique
+            all_groups.append([(path_idx, wires_polygons[0][0])])
+            print(f"  Group formed. Outer wire: {wires_polygons[0][0]} with no inner wires.")
+            break  # On passe au prochain groupe de path_idx
+
+        # Initialisation de l'ensemble des wires utilisés pour éviter les doublons
         used = set()
         # Logique d'inclusion (contour principal + trous) dans ce groupe
-        for i, (outer_w, outer_poly) in enumerate(wires_polygons):
-            if i in used:
+        for wire_poly_ref, (outer_w, outer_poly) in enumerate(wires_polygons):
+            if wire_poly_ref in used:
                 continue  # Ce wire a déjà été utilisé comme inner
             inners = []
-            for j, (inner_w, inner_poly) in enumerate(wires_polygons):
-                if i != j and outer_poly.contains(inner_poly):
+            for wire_poly_test, (inner_w, inner_poly) in enumerate(wires_polygons):
+                if wire_poly_ref != wire_poly_test and outer_poly.contains(inner_poly):
                     inners.append(inner_w)
-                    used.add(j)
-            # Ajoute le groupe [outer, inner1, ...] à la liste globale
-            all_groups.append([outer_w] + inners)
-            used.add(i)
+                    used.add(wire_poly_test)
+
+            # si il ne reste plus de fils intérieurs à traiter, on ajoute le groupe
+            if len(inners) == len(wires_polygons) - 1:
+                all_groups.append((path_idx, [outer_w] + inners))
+                print(f"  Group formed. Outer wire: {outer_w}, inners: {inners}")
+                break  # On passe au prochain wire principal
+
+    # check all path_idx has been used
+    used_path_indices = {g[0] for g in all_groups}
+    for path_idx in path_idx_to_wire_indices.keys():
+        if path_idx not in used_path_indices:
+            print(f"[WARNING] Path index {path_idx} not used in any group, possible issue with SVG structure.")
+
     return all_groups
 
 def scale_wire_2d(wire, scale_factor):
