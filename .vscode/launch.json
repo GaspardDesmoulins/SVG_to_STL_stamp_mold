@@ -8,11 +8,11 @@
       "program": "${workspaceFolder}/main.py",
       "args": [
         "--svg",
-        "${workspaceFolder}/le_chat.svg",
+        "${workspaceFolder}/svgs/le_chat.svg",
         "--size",
         "40",
         "--output",
-        "moule_chat.stl",
+        "${workspaceFolder}/svgs/moule_chat.stl",
         "--export-steps"
       ],
       "console": "integratedTerminal"
@@ -24,11 +24,11 @@
       "program": "${workspaceFolder}/main.py",
       "args": [
         "--svg",
-        "${workspaceFolder}/Anneau_simple.svg",
+        "${workspaceFolder}/svgs/Anneau_simple.svg",
         "--size",
         "40",
         "--output",
-        "moule_anneau.stl",
+        "${workspaceFolder}/svgs/moule_anneau.stl",
         "--export-steps"
       ],
       "console": "integratedTerminal"

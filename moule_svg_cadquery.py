@@ -3,6 +3,7 @@ from svgpathtools import svg2paths2
 import numpy as np
 from pathlib import Path
 import os
+import shutil
 from xml.etree import ElementTree as ET
 import re
 from scipy.spatial import ConvexHull
@@ -418,10 +419,12 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         print(f"STL de la base (avec bordure) exporté : {base_stl_path}")
     return base_mold
 
-def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir):
+def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
+                      original_svg_path=None, shape_keys=None):
     """
     Grave les polygones sur le moule, met à jour shape_history['engraved'] pour chaque shape.
     Retourne le moule gravé et la liste des indices gravés.
+    Génère un SVG de résumé à chaque étape de gravure.
     """
     engraved_indices = []
     # Utiliser le regroupement par path_idx puis inclusion
@@ -510,6 +513,10 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                             step_stl_path = os.path.join(debug_dir, f"step_{idx}.stl")
                             cq.exporters.export(new_mold, step_stl_path)
                             print(f"Export STL intermédiaire réussi : {step_stl_path}")
+                        # --- Génération du SVG de résumé pour cette étape ---
+                        if original_svg_path is not None and shape_keys is not None:
+                            summary_svg_path = os.path.join(debug_dir, f"step_{idx}_summary.svg")
+                            generate_summary_svg(original_svg_path, shape_keys, summary_svg_path, shape_history)
                     except Exception as ce:
                         print(f"Erreur lors du cut avec l'extrusion du groupe {idx} : {ce}")
                 else:
@@ -533,6 +540,12 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
 def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, border_height=BORDER_HEIGHT,
                            border_thickness=BORDER_THICKNESS, engrave_depth=ENGRAVE_DEPTH, margin=MARGE,
                            export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False):
+    # Détermination du nom du dossier de debug à partir du nom du fichier SVG
+    svg_basename = os.path.splitext(os.path.basename(svg_file))[0]
+    debug_dir = f"debug_{svg_basename}"
+    shutil.rmtree(debug_dir, ignore_errors=True)
+    os.makedirs(debug_dir, exist_ok=True)
+
     normalized_svg_file = normalize_svg_fill(svg_file)
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
 
@@ -541,15 +554,16 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
         if isinstance(k, tuple):
             shape_history[k]['engraved'] = False
 
-    debug_dir = "debug_stl"
-    os.makedirs(debug_dir, exist_ok=True)
-
     mold = create_mold_base(
         svg_wires, margin, base_thickness, border_height, border_thickness, debug_dir, base_stl_name, export_base_stl=export_base_stl
     )
 
+    # Récupération de la liste des shape_keys pour le résumé SVG
+    shape_keys = [k for k in shape_history if isinstance(k, tuple)]
+
     mold, engraved_indices = engrave_polygons(
-        mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir
+        mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
+        original_svg_path=svg_file, shape_keys=shape_keys
     )
 
     return mold, engraved_indices, shape_history
