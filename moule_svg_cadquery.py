@@ -440,84 +440,93 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     for group_idx, wire_group in grouped_wires:
         try:
             print(f"\n--- Gravure polygone {group_idx} (groupe de {len(wire_group)} wires) ---")
-            # on construit un face à partir des wires du groupe
-            for w_idx, w in enumerate(wire_group):
+            # Affichage d'informations sur chaque wire du groupe
+            for wire_index, wire in enumerate(wire_group):
                 try:
-                    global_wire_index = svg_wires.index(w)
+                    global_wire_index = svg_wires.index(wire)
                 except ValueError:
                     global_wire_index = None
                 shape_info = wire_to_shape.get(global_wire_index, None)
                 if shape_info is not None:
                     hist = shape_history[shape_info]
-                    print(f"  Wire {w_idx} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
+                    print(f"  Wire {wire_index} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
                 else:
-                    print(f"  Wire {w_idx} (global idx {global_wire_index}): [shape SVG non trouvée]")
-                print(f"    isClosed: {w.IsClosed()}, isValid: {w.isValid()}, nb sommets: {len(list(w.Vertices()))}")
-            try:
-                face_result = cq.Face.makeFromWires(wire_group[0], wire_group[1:])
-            except Exception as e:
-                print(f"Erreur makeFromWires sur groupe {group_idx}: {e}")
-                mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
-                continue
-            if isinstance(face_result, list):
-                if not face_result:
-                    print(f"Polygone {group_idx} : makeFromWires a retourné une liste vide.")
-                    continue
-                face = face_result[0]
-            else:
-                face = face_result
-            
-            #on tente d'extruder la face en extrusion directe
-            engraving = cq.Workplane("XY").add(face).extrude(-engrave_depth)
-            print(f"[DEBUG] Type engraving après extrusion directe: {type(engraving)}")
-
-            # si l'extrusion directe échoue, on utilise la dépouille
-            if engraving is None:
-                # --- Gravure avec dépouille (loft) ---
-                draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
-                engraving = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
-                print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving)}")
-
-            # Simplification des solides extrudés
+                    print(f"  Wire {wire_index} (global idx {global_wire_index}): [shape SVG non trouvée]")
+                print(f"    isClosed: {wire.IsClosed()}, isValid: {wire.isValid()}, nb sommets: {len(list(wire.Vertices()))}")
+            # 1. Tenter d'abord le loft avec dépouille
+            draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
+            engraving = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
+            print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving)}")
             engravings = flatten_cq_solids(engraving)
-            print(f"[DEBUG] Types des objets retournés par flatten_cq_solids: {[type(e) for e in engravings]}")
-            if not engravings:
-                print(f"Warning: Extrusion du groupe {group_idx} n'a pas produit de solide.")
-                mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
-                continue
-            success = False
+            print(f"[DEBUG] Types des objets retournés par flatten_cq_solids (loft): {[type(e) for e in engravings]}")
+            valid_loft = False
             for engraving_solid in engravings:
-                print(f"[DEBUG] engraving_solid type: {type(engraving_solid)}")
-                # Vérifie la présence de isValid()
-                if hasattr(engraving_solid, 'isValid'):
-                    valid = engraving_solid.isValid()
-                else:
-                    valid = False
-                print(f"[DEBUG] engraving_solid.isValid() = {valid}")
-                if valid and hasattr(engraving_solid, 'ShapeType') and engraving_solid.ShapeType() in ["Solid", "Compound"]:
+                if hasattr(engraving_solid, 'isValid') and engraving_solid.isValid() and hasattr(engraving_solid, 'ShapeType') and engraving_solid.ShapeType() in ["Solid", "Compound"]:
+                    valid_loft = True
                     engraving_solid = engraving_solid.translate((0, 0, base_thickness))
                     try:
-                        # Gravure explicite du moule par appel de cut()
                         new_mold = mold.cut(engraving_solid)
                         mold = new_mold
-                        success = True
                         if export_steps:
                             step_stl_path = os.path.join(debug_dir, f"step_{group_idx}.stl")
                             cq.exporters.export(new_mold, step_stl_path)
-                            print(f"Export STL intermédiaire réussi : {step_stl_path}")
-                        # --- Génération du SVG de résumé pour cette étape ---
+                            print(f"Export STL intermédiaire réussi (loft) : {step_stl_path}")
                         if original_svg_path is not None and shape_keys is not None:
                             summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
                             generate_summary_svg(original_svg_path, shape_keys, summary_svg_path, shape_history)
+                        engraved_indices.append(group_idx)
+                        print(f"Groupe {group_idx} gravé avec succès (loft).")
+                        continue  # On ne tente pas l'extrusion directe si le loft a réussi
                     except Exception as ce:
-                        print(f"Erreur lors du cut avec l'extrusion du groupe {group_idx} : {ce}")
+                        print(f"Erreur lors du cut avec l'extrusion du groupe {group_idx} (loft) : {ce}")
+                        valid_loft = False
+            if not valid_loft:
+                print(f"Warning: Loft du groupe {group_idx} n'a pas produit de solide valide.")
+                # 2. Si le loft échoue, tenter l'extrusion directe
+                print(f"--- Tentative d'extrusion directe pour le groupe {group_idx} ---")
+                try:
+                    face_result = cq.Face.makeFromWires(wire_group[0], wire_group[1:])
+                except Exception as e:
+                    print(f"Erreur makeFromWires sur groupe {group_idx}: {e}")
+                    mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
+                    continue
+                if isinstance(face_result, list):
+                    if not face_result:
+                        print(f"Polygone {group_idx} : makeFromWires a retourné une liste vide.")
+                        continue
+                    face = face_result[0]
                 else:
-                    print(f"Warning: Extrusion du groupe {group_idx} n'a pas produit un solide valide.")
-            if success:
-                engraved_indices.append(group_idx)
-            # Mise à jour de shape_history pour indiquer que le groupe a été gravé
-            print(f"Groupe {group_idx} gravé avec succès : {success}.")
-            mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
+                    face = face_result
+                engraving = cq.Workplane("XY").add(face).extrude(-engrave_depth)
+                print(f"[DEBUG] Type engraving après extrusion directe: {type(engraving)}")
+                engravings = flatten_cq_solids(engraving)
+                print(f"[DEBUG] Types des objets retournés par flatten_cq_solids (extrusion): {[type(e) for e in engravings]}")
+                valid_extrude = False
+                for engraving_solid in engravings:
+                    if hasattr(engraving_solid, 'isValid') and engraving_solid.isValid() and hasattr(engraving_solid, 'ShapeType') and engraving_solid.ShapeType() in ["Solid", "Compound"]:
+                        valid_extrude = True
+                        engraving_solid = engraving_solid.translate((0, 0, base_thickness))
+                        try:
+                            new_mold = mold.cut(engraving_solid)
+                            mold = new_mold
+                            if export_steps:
+                                step_stl_path = os.path.join(debug_dir, f"step_{group_idx}.stl")
+                                cq.exporters.export(new_mold, step_stl_path)
+                                print(f"Export STL intermédiaire réussi (extrusion) : {step_stl_path}")
+                            if original_svg_path is not None and shape_keys is not None:
+                                summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
+                                generate_summary_svg(original_svg_path, shape_keys, summary_svg_path, shape_history)
+                            engraved_indices.append(group_idx)
+                            print(f"Groupe {group_idx} gravé avec succès (extrusion directe).")
+                        except Exception as ce:
+                            print(f"Erreur lors du cut avec l'extrusion du groupe {group_idx} (extrusion directe) : {ce}")
+                        break
+                if not valid_extrude:
+                    print(f"Warning: Extrusion du groupe {group_idx} n'a pas produit de solide valide.")
+                    mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
+            else:
+                # Mise à jour de shape_history pour indiquer que le groupe a été gravé
+                mark_wires_not_engraved(wire_group, svg_wires, shape_history, group_idx)
         except Exception as e:
             print(f"Erreur lors de la gravure du groupe {group_idx}: {e}")
     return mold, engraved_indices
@@ -714,7 +723,7 @@ def group_wires_by_inclusion(wires, shape_history=None):
                 all_groups.append((path_idx, group))
                 used_indices.add(outer_index)
                 used_indices.update(inners_indices)
-                print(f"  Group formed. Outer wire: {wires_polygons[outer_index][0]}, inners: {[wires_polygons[j][0] for j in inners_indices]}")
+                print(f"  Group formed. Outer wire index: {outer_index}, inner wires idxs: {[j for j in inners_indices]}")
             else:
                 # Aucun wire restant ne contient d'autres, on ajoute les restants seuls
                 for idx in range(len(wires_polygons)):
