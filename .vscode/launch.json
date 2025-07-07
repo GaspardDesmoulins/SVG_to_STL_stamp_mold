@@ -1,0 +1,37 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Débogueur Python : Fichier chat STL",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/le_chat.svg",
+        "--size",
+        "40",
+        "--output",
+        "moule_chat.stl",
+        "--export-steps"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Débogueur Python : Fichier Anneau STL",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/Anneau_simple.svg",
+        "--size",
+        "40",
+        "--output",
+        "moule_anneau.stl",
+        "--export-steps"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}

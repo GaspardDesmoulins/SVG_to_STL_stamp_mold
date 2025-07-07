@@ -5,19 +5,11 @@ from pathlib import Path
 import os
 from xml.etree import ElementTree as ET
 import re
-import argparse
 from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon
 import math
-
-
-# === Paramètres du moule ===
-MAX_DIMENSION = 100             # Dimension maximale (mm) du moule
-MARGE = 2                       # Distance minimale entre motif et bordure
-BASE_THICKNESS = 5             # Épaisseur de la base du moule
-BORDER_HEIGHT = 4              # Hauteur des bordures du moule
-BORDER_THICKNESS = 2           # Épaisseur des bordures
-ENGRAVE_DEPTH = 2              # Profondeur d'extrusion du motif
+from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
+    MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
 
 def find_parent(root, child):
     for parent in root.iter():
@@ -159,7 +151,7 @@ def filter_points(points):
     return filtered
 
 
-def svg_to_cadquery_wires(svg_file, max_dimension, interactive=True, force_all_contours=False):
+def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=True, force_all_contours=False):
     """
     Convertit un SVG en wires CadQuery, avec simplification et gestion de l'échelle.
     Peut forcer l'extraction de tous les contours (utile pour les SVG Affinity Designer).
@@ -413,18 +405,18 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         # Anneau = extérieur - intérieur
         border_ring = border_outer_shape.cut(border_inner_shape)
         # Fusionne base et anneau
-        mold = base_shape.fuse(border_ring)
+        base_mold = base_shape.fuse(border_ring)
         print("Bordure en anneau générée et fusionnée à la base.")
     else:
-        mold = base_shape
+        base_mold = base_shape
         print("Pas de bordure générée, seule la base est utilisée.")
 
     # --- Export STL de la base avant gravure dans debug_stl/ ---
     base_stl_path = os.path.join(debug_dir, os.path.basename(base_stl_name))
     if export_base_stl:
-        cq.exporters.export(mold, base_stl_path)
+        cq.exporters.export(base_mold, base_stl_path)
         print(f"STL de la base (avec bordure) exporté : {base_stl_path}")
-    return mold, base_outline_wire
+    return base_mold
 
 def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir):
     """
@@ -538,7 +530,9 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
             print(f"Erreur lors de la gravure du groupe {idx}: {e}")
     return mold, engraved_indices
 
-def generate_cadquery_mold(svg_file, max_dim, base_thickness, border_height, border_thickness, engrave_depth, margin=MARGE, export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False):
+def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, border_height=BORDER_HEIGHT,
+                           border_thickness=BORDER_THICKNESS, engrave_depth=ENGRAVE_DEPTH, margin=MARGE,
+                           export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False):
     normalized_svg_file = normalize_svg_fill(svg_file)
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
 
@@ -550,7 +544,7 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness, border_height, bor
     debug_dir = "debug_stl"
     os.makedirs(debug_dir, exist_ok=True)
 
-    mold, base_outline_wire = create_mold_base(
+    mold = create_mold_base(
         svg_wires, margin, base_thickness, border_height, border_thickness, debug_dir, base_stl_name, export_base_stl=export_base_stl
     )
 
@@ -837,49 +831,4 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
     except Exception as e:
         print(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
         return None
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Génère un moule à silicone depuis un SVG avec CadQuery.")
-    parser.add_argument("--svg", help="Chemin du fichier SVG")
-    parser.add_argument("--size", type=float, default=MAX_DIMENSION, help="Taille max du moule (mm)")
-    parser.add_argument("--output", default="moule_cadquery.stl", help="Fichier de sortie STL")
-    parser.add_argument("--no-interactive", action="store_true", help="Désactive le mode interactif")
-    parser.add_argument("--export-steps", action="store_true", help="Exporter les étapes intermédiaires en STL")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.svg):
-        print(f"Le fichier SVG {args.svg} n'existe pas. Création d'un fichier SVG de test.")
-        with open("test_rect.svg", "w") as f:
-            f.write("<svg width=\"100\" height=\"100\" xmlns=\"http://www.w3.org/2000/svg\"><rect x=\"10\" y=\"10\" width=\"80\" height=\"80\" fill=\"blue\" /></svg>")
-        args.svg = "test_rect.svg"
-
-    ignored_indices = []
-    try:
-        mold, engraved_indices, shape_history = generate_cadquery_mold(
-            args.svg,
-            args.size,
-            BASE_THICKNESS,
-            BORDER_HEIGHT,
-            BORDER_THICKNESS,
-            ENGRAVE_DEPTH,
-            margin=MARGE,
-            export_base_stl=True,
-            base_stl_name="moule_base.stl",
-            export_steps=args.export_steps if hasattr(args, 'export_steps') else False
-        )
-        # Export final
-        cq.exporters.export(mold, args.output)
-        print(f"Moule CadQuery généré : {args.output}")
-        engraved_shape_keys = [k for k, v in shape_history.items() if isinstance(k, tuple) and v.get('engraved')]
-        ignored_shape_keys = [k for k, v in shape_history.items() if isinstance(k, tuple) and not v.get('engraved')]
-        # Génération du SVG de résumé avec couleurs distinctes
-        all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
-        if all_shape_keys:
-            generate_summary_svg(args.svg, all_shape_keys, f'summary_{args.svg.split("/")[-1]}', shape_history=shape_history)
-            print("SVG de résumé généré avec couleurs selon le statut de gravure.")
-        else:
-            print("Aucun polygone détecté, pas de SVG de visualisation généré.")
-    except ValueError as e:
-        print(f"Erreur lors de la génération du moule : {e}")
-
 
