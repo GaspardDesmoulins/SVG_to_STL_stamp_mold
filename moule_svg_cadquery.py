@@ -7,7 +7,7 @@ import shutil
 from xml.etree import ElementTree as ET
 import re
 from scipy.spatial import ConvexHull
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon as ShapelyPolygon
 import math
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
@@ -54,11 +54,10 @@ def propagate_attributes(elem, inherited=None):
             if attr not in elem.attrib:
                 elem.attrib[attr] = value
 
-def normalize_svg_fill(svg_file_path):
+def normalize_svg_fill(svg_file_path, debug_dir=None):
     tree = ET.parse(svg_file_path)
     root = tree.getroot()
 
-    
     for elem in root.iter():
         elem.tag = strip_namespace(elem.tag)
         elem.attrib = {strip_namespace(k): v for k, v in elem.attrib.items()}
@@ -72,7 +71,15 @@ def normalize_svg_fill(svg_file_path):
                 parent.remove(elem)
 
     normalized_svg = ET.tostring(root, encoding='unicode')
-    normd_file_path = write_svg_to_file(normalized_svg, svg_file_path)
+    # Détermine le chemin du fichier normalisé
+    if debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(svg_file_path))[0]
+        normd_file_path = os.path.join(debug_dir, f"{base_name}_normalized.svg")
+        with open(normd_file_path, "w") as f:
+            f.write(normalized_svg)
+    else:
+        normd_file_path = write_svg_to_file(normalized_svg, svg_file_path)
     return normd_file_path
 
 def extract_subpaths(path, sampling):
@@ -539,14 +546,14 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
 
 def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, border_height=BORDER_HEIGHT,
                            border_thickness=BORDER_THICKNESS, engrave_depth=ENGRAVE_DEPTH, margin=MARGE,
-                           export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False):
+                           export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False,
+                           keep_debug_files=False):
     # Détermination du nom du dossier de debug à partir du nom du fichier SVG
     svg_basename = os.path.splitext(os.path.basename(svg_file))[0]
     debug_dir = f"debug_{svg_basename}"
-    shutil.rmtree(debug_dir, ignore_errors=True)
     os.makedirs(debug_dir, exist_ok=True)
 
-    normalized_svg_file = normalize_svg_fill(svg_file)
+    normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
 
     # Initialisation du statut 'engraved' pour chaque shape
@@ -565,6 +572,10 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
         mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
         original_svg_path=svg_file, shape_keys=shape_keys
     )
+
+    # Suppression du dossier de debug si demandé
+    if not keep_debug_files:
+        shutil.rmtree(debug_dir, ignore_errors=True)
 
     return mold, engraved_indices, shape_history
 
@@ -656,7 +667,7 @@ def group_wires_by_inclusion(wires, shape_history=None):
         # Conversion de chaque wire en polygone Shapely
         for w in wires:
             pts = [(v.X, v.Y) for v in w.Vertices()]
-            wires_polygons.append((w, Polygon(pts)))
+            wires_polygons.append((w, ShapelyPolygon(pts)))
         used = set()
         for i, (outer_w, outer_poly) in enumerate(wires_polygons):
             if i in used:
@@ -688,7 +699,7 @@ def group_wires_by_inclusion(wires, shape_history=None):
         wires_polygons = []
         for w in wires_in_group:
             pts = [(v.X, v.Y) for v in w.Vertices()]
-            wires_polygons.append((w, Polygon(pts)))
+            wires_polygons.append((w, ShapelyPolygon(pts)))
         used = set()
         # Logique d'inclusion (contour principal + trous) dans ce groupe
         for i, (outer_w, outer_poly) in enumerate(wires_polygons):
@@ -711,74 +722,79 @@ def scale_wire_2d(wire, scale_factor):
     scaled_pts = centroid + (pts - centroid) * scale_factor
     return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in scaled_pts])
 
-def offset_polygon_along_normals(points, offset, centroid_dir=1):
+def offset_polygon_along_normals(points, offset_distance, centroid_direction=1):
     """
     Décale chaque point d'un polygone selon la normale locale à la bordure.
     - points : liste de tuples (x, y) du polygone (doit être fermé ou sera fermé automatiquement)
-    - offset : distance de décalage (positive)
-    - centroid_dir : +1 pour outer (vers l'extérieur du centroïde), -1 pour inner (vers le centroïde)
+    - offset_distance : distance de décalage (positive)
+    - centroid_direction : +1 pour outer (vers l'extérieur du centroïde), -1 pour inner (vers le centroïde)
     Retourne une nouvelle liste de points décalés.
     """
     # Filtre les points dupliqués consécutifs
-    filtered = [points[0]]
-    for p in points[1:]:
-        if np.linalg.norm(np.array(p) - np.array(filtered[-1])) > 1e-10:
-            filtered.append(p)
-    points = filtered
+    filtered_points = [points[0]]
+    for pt in points[1:]:
+        if np.linalg.norm(np.array(pt) - np.array(filtered_points[-1])) > 1e-10:
+            filtered_points.append(pt)
+    points = filtered_points
     pts = np.array(points)
+    num_points = len(pts)
+    # S'assurer que le polygone est fermé (premier et dernier point identiques)
     if not np.allclose(pts[0], pts[-1]):
-        pts = np.vstack([pts, pts[0]])  # Ferme le polygone si besoin
-    n = len(pts) - 1  # nombre de segments
-    centroid = pts[:-1].mean(axis=0)
-    new_pts = []
-    for i in range(n):
-        p_prev = pts[i - 1]
-        p = pts[i]
-        p_next = pts[(i + 1) % n]
+        closed_pts = np.vstack([pts, pts[0]])
+    else:
+        closed_pts = pts
+    centroid = pts.mean(axis=0)
+    offset_points = []
+    for i in range(num_points):
+        prev_point = closed_pts[(i - 1) % num_points]
+        current_point = closed_pts[i]
+        next_point = closed_pts[(i + 1) % num_points]
         # Vecteurs des segments adjacents
-        v1 = p - p_prev
-        v2 = p_next - p
+        vec_prev = current_point - prev_point
+        vec_next = next_point - current_point
         # Normales aux segments (sens trigo)
-        n1 = np.array([-v1[1], v1[0]])
-        n2 = np.array([-v2[1], v2[0]])
-        norm1 = np.linalg.norm(n1)
-        norm2 = np.linalg.norm(n2)
-        if norm1 < 1e-10 or norm2 < 1e-10:
+        normal_prev = np.array([-vec_prev[1], vec_prev[0]])
+        normal_next = np.array([-vec_next[1], vec_next[0]])
+        norm_prev = np.linalg.norm(normal_prev)
+        norm_next = np.linalg.norm(normal_next)
+        if norm_prev < 1e-10 or norm_next < 1e-10:
             # Si un segment est nul, saute la normale correspondante
-            normal = n1 if norm2 < 1e-10 else n2
+            normal = normal_prev if norm_next < 1e-10 else normal_next
             if np.linalg.norm(normal) < 1e-10:
                 normal = np.array([1.0, 0.0])  # Valeur par défaut
         else:
-            n1 /= norm1
-            n2 /= norm2
+            normal_prev /= norm_prev
+            normal_next /= norm_next
             # Normale moyenne au sommet
-            normal = (n1 + n2)
+            normal = (normal_prev + normal_next)
             if np.linalg.norm(normal) < 1e-8:
-                normal = n1  # Cas angle plat
+                normal = normal_prev  # Cas angle plat
             else:
                 normal /= np.linalg.norm(normal)
         # Sens de la normale (vers l'extérieur ou l'intérieur)
-        to_centroid = centroid - p
-        if np.dot(normal, to_centroid) * centroid_dir > 0:
+        to_centroid = centroid - current_point
+        if np.dot(normal, to_centroid) * centroid_direction > 0:
             normal = -normal
-        new_p = p + offset * normal
-        new_pts.append(tuple(new_p))
+        offset_point = current_point + offset_distance * normal
+        offset_points.append(tuple(offset_point))
     # Ferme le polygone
-    new_pts.append(new_pts[0])
-    return new_pts
+    offset_points.append(offset_points[0])
+    if not ShapelyPolygon(offset_points).is_simple:
+        print("[WARNING] Polygone offset non simple, possible auto-intersection")
+    return offset_points
 
-def get_scaled_wire_from_wire(wire, offset, centroid_dir):
+def get_scaled_wire_from_wire(wire, offset, centroid_direction):
     """
     Génère un wire décalé (scaled) à partir d'un wire d'origine, selon la normale locale et un offset.
     Args:
         wire (cq.Wire): Wire d'origine
         offset (float): Distance de décalage
-        centroid_dir (int): +1 pour outer, -1 pour inner
+        direction_centroid (int): +1 pour outer, -1 pour inner
     Returns:
         cq.Wire: Wire décalé
     """
     wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
-    offset_points = offset_polygon_along_normals(wire_points, offset, centroid_dir=centroid_dir)
+    offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
     return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in offset_points])
 
 
@@ -807,9 +823,9 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
         # Parcours de chaque wire du groupe (contour principal + trous)
         for wire_index, wire in enumerate(wire_group):
             # Sens de l'offset : +1 pour outer, -1 pour inners
-            direction_centroid = 1 if wire_index == 0 else -1
+            centroid_direction = 1 if wire_index == 0 else -1
             # Génération du wire décalé via la fonction dédiée
-            scaled_wire = get_scaled_wire_from_wire(wire, offset, direction_centroid)
+            scaled_wire = get_scaled_wire_from_wire(wire, offset, centroid_direction)
             # Création des faces (top = wire décalé, bottom = wire original)
             try:
                 face_top = cq.Face.makeFromWires(scaled_wire)

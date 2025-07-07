@@ -11,7 +11,7 @@ if __name__ == "__main__":
     parser.add_argument("--size", type=float, default=MAX_DIMENSION, help="Taille max du moule (mm)")
     parser.add_argument("--output", default="moule_cadquery.stl", help="Fichier de sortie STL")
     parser.add_argument("--no-interactive", action="store_true", help="Désactive le mode interactif")
-    parser.add_argument("--export-steps", action="store_true", help="Exporter les étapes intermédiaires en STL")
+    parser.add_argument("--keep-debug-files", action="store_true", help="Conserver le répertoire de debug et les fichiers intermédiaires")
     args = parser.parse_args()
 
     if not os.path.exists(args.svg):
@@ -32,7 +32,7 @@ if __name__ == "__main__":
             margin=MARGE,
             export_base_stl=True,
             base_stl_name="moule_base.stl",
-            export_steps=args.export_steps if hasattr(args, 'export_steps') else False
+            keep_debug_files=args.keep_debug_files if hasattr(args, 'keep_debug_files') else False
         )
         # Export final
         cq.exporters.export(mold, args.output)
