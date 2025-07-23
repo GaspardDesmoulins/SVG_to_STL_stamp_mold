@@ -12,6 +12,39 @@ import math
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
 
+def parse_transform(transform_str):
+    """
+    Parse une chaîne de transformation SVG (matrix, translate, scale, etc.) et retourne la matrice 3x3.
+    Seul 'matrix(a,b,c,d,e,f)' est géré pour l'instant.
+    """
+    import re
+    if not transform_str:
+        return np.eye(3)
+    m = re.search(r"matrix\(([^)]+)\)", transform_str)
+    if m:
+        vals = [float(v) for v in m.group(1).split(",")]
+        if len(vals) == 6:
+            a, b, c, d, e, f = vals
+            mat = np.array([
+                [a, c, e],
+                [b, d, f],
+                [0, 0, 1]
+            ])
+            return mat
+    # Si pas de matrix, retourne identité
+    return np.eye(3)
+
+def get_cumulative_transform(elem):
+    """
+    Remonte l'arbre XML pour cumuler toutes les transformations des groupes parents.
+    """
+    mat = np.eye(3)
+    while elem is not None:
+        transform_str = elem.attrib.get('transform', None)
+        mat = parse_transform(transform_str) @ mat
+        elem = elem.getparent() if hasattr(elem, 'getparent') else None
+    return mat
+
 def find_parent(root, child):
     for parent in root.iter():
         if child in list(parent):
@@ -175,38 +208,93 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
     shape_keys = []
     wire_to_shape = {}
 
+    # --- Étape 1 : Extraction des transformations SVG imbriquées ---
+    # On utilise ElementTree pour parcourir l'arbre SVG et retrouver les groupes <g> et leurs transformations.
+    # Pour chaque <path>, on reconstruit la liste de ses parents (groupes) pour cumuler toutes les matrices de transformation.
+    tree = ET.parse(str(svgfile.absolute()))
+    root = tree.getroot()
+    # Récupère tous les éléments <path> dans l'ordre d'apparition dans le SVG
+    svg_path_elements = [el for el in root.iter() if strip_namespace(el.tag) == 'path']
+    # Liste des tuples (élément <path>, matrice de transformation cumulée)
+    path_with_transform = []
+    for path_elem in svg_path_elements:
+        # On va remonter l'arbre XML pour récupérer tous les groupes parents (<g>) et cumuler leurs transformations
+        parent_groups = []
+        current_elem = path_elem
+        # Remontée de l'arbre : on cherche le parent de chaque élément jusqu'à la racine
+        while True:
+            found_parent = False
+            for possible_parent in root.iter():
+                if current_elem in list(possible_parent):
+                    parent_groups.append(possible_parent)
+                    current_elem = possible_parent
+                    found_parent = True
+                    break
+            if not found_parent:
+                break
+        # Les parents sont du plus bas (proche du path) au plus haut (racine), on inverse pour appliquer les transformations dans l'ordre SVG
+        parent_groups = parent_groups[::-1]
+        # On initialise la matrice de transformation à l'identité
+        cumulative_transform = np.eye(3)
+        # On applique chaque transformation de groupe parent (de la racine vers le path)
+        for group_elem in parent_groups:
+            cumulative_transform = parse_transform(group_elem.attrib.get('transform', None)) @ cumulative_transform
+        # Enfin, on applique la transformation du path lui-même
+        cumulative_transform = parse_transform(path_elem.attrib.get('transform', None)) @ cumulative_transform
+        # On stocke l'élément <path> et sa matrice de transformation cumulée
+        path_with_transform.append((path_elem, cumulative_transform))
+    # --- Fin extraction transformations imbriquées ---
+
     def is_visible(attr):
-        # Détermine si un élément doit être extrait (fill ou stroke visible, ou extraction forcée)
         if force_all_contours:
             return True
         fill = attr.get('fill', None)
         stroke = attr.get('stroke', None)
-        # On considère visible si fill n'est pas none/transparent OU stroke n'est pas none/transparent
         def is_none_or_transparent(val):
             if val is None:
-                return False  # Si absent, on considère visible
+                return False
             val = val.strip().lower()
             return val in ['none', 'transparent']
         return not (is_none_or_transparent(fill) and is_none_or_transparent(stroke))
 
-    for path_idx, (path, attr) in enumerate(zip(paths, attributes)):
-        if not is_visible(attr):
+    # --- Étape 2 : Application des transformations à chaque path SVG ---
+    # On parcourt les paths extraits par svg2paths2, mais on applique la matrice trouvée à chaque point du path.
+    # On suppose que l'ordre des paths svgpathtools et des éléments XML <path> est identique (plus robuste que la comparaison d'attributs).
+    for path_idx, (svgpathtools_path, svgpathtools_attr) in enumerate(zip(paths, attributes)):
+        if not is_visible(svgpathtools_attr):
             continue
         print(f"\n--- Path {path_idx} ---")
-        subpaths = extract_subpaths(path, sampling_default)
+        # Récupère la matrice de transformation cumulée pour ce path
+        if path_idx < len(path_with_transform):
+            cumulative_transform = path_with_transform[path_idx][1]
+        else:
+            cumulative_transform = np.eye(3)
+        # Extraction des sous-chemins (subpaths) du path SVG
+        subpaths = extract_subpaths(svgpathtools_path, sampling_default)
         print(f"Subpaths {len(subpaths)}")
         for sub_idx, sampled_points in enumerate(subpaths):
             if sampled_points:
-                simple_points = rdp(sampled_points, epsilon=0.2)
-                all_points.extend(simple_points)
-                shapes_data.append(simple_points)
+                # --- Application de la matrice de transformation à chaque point du path ---
+                # On transforme chaque point [x, y] en [x', y'] via la matrice SVG cumulée
+                transformed_points = []
+                for pt in sampled_points:
+                    # On homogénéise le point pour la matrice 3x3
+                    pt_homogeneous = np.array([pt[0], pt[1], 1])
+                    pt_transformed = cumulative_transform @ pt_homogeneous  # Multiplication matrice
+                    transformed_points.append([pt_transformed[0], pt_transformed[1]])
+                # Simplification des points (Ramer-Douglas-Peucker)
+                simplified_points = rdp(transformed_points, epsilon=0.2)
+                # Ajout des points transformés à la liste globale
+                all_points.extend(simplified_points)
+                shapes_data.append(simplified_points)
                 shape_keys.append((path_idx, sub_idx))
+                # On stocke dans shape_history toutes les infos utiles pour le debug et la génération du SVG de résumé
                 shape_history[(path_idx, sub_idx)] = {
                     'svg_path_idx': path_idx,
                     'svg_sub_idx': sub_idx,
-                    'svg_attr': dict(attr),
-                    'sampled_points': sampled_points,
-                    'simplified_points': simple_points,
+                    'svg_attr': dict(svgpathtools_attr),
+                    'sampled_points': transformed_points,
+                    'simplified_points': simplified_points,
                     'cq_wire_index': None,
                 }
 
@@ -599,30 +687,62 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     group = ET.Element('g', {'id': 'summary_polygons'})
     new_root.append(group)
 
-    # Ajout des polygones colorés à partir des points simplifiés
-    if shape_history is not None:
+    # --- Nouvelle logique : utiliser les points recalés et mis à l'échelle (ceux utilisés pour l'extrusion du moule) ---
+    # Cela garantit que la position des polygones dans le SVG de résumé correspond à celle sur le moule.
+    if shape_history is not None and len(shape_keys) >= 2:
+        # Récupère les polygones recalés et mis à l'échelle (ceux utilisés pour l'extrusion)
+        polygons = []
         for (path_idx, sub_idx) in shape_keys:
             hist = shape_history.get((path_idx, sub_idx), None)
             if hist is not None:
-                pts = hist.get('simplified_points', [])
+                # On utilise les points filtrés et mis à l'échelle, qui correspondent à la géométrie du moule
+                pts = hist.get('extrusion_points', hist.get('simplified_points', []))
                 if len(pts) >= 3:
-                    points_str = ' '.join(f"{x},{y}" for x, y in pts)
-                    engraved = hist.get('engraved', True) # Par défaut on considère gravé pour le résumé d'étape
-                    style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
-                    polygon_elem = ET.Element('polygon', {
-                        'points': points_str,
-                        'style': style,
-                        'data-pathidx': str(path_idx),
-                        'data-subidx': str(sub_idx)
-                    })
-                    group.append(polygon_elem)
-
-        # Écriture du nouveau fichier SVG
-        new_tree = ET.ElementTree(new_root)
-        new_tree.write(output_svg_name, encoding='utf-8', xml_declaration=True)
-        print(f"SVG généré : {output_svg_name}")
+                    polygons.append(pts)
+        if len(polygons) >= 2:
+            # Génère un seul path SVG combinant les deux polygones (extérieur et intérieur)
+            # Utilise la règle de remplissage 'evenodd' pour afficher l'anneau
+            def points_to_svg_path(pts):
+                # Convertit une liste de points en commande path SVG
+                return 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z'
+            path_d = ''
+            for pts in polygons:
+                path_d += points_to_svg_path(pts) + ' '
+            # Style : noir si gravé, rouge sinon (on prend le statut du polygone extérieur)
+            engraved = shape_history.get(shape_keys[0], {}).get('engraved', True)
+            style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
+            path_elem = ET.Element('path', {
+                'd': path_d.strip(),
+                'style': style,
+                'fill-rule': 'evenodd',
+                'data-pathidx': str(shape_keys[0][0]),
+                'data-subidx': str(shape_keys[0][1])
+            })
+            group.append(path_elem)
+        else:
+            # Cas général : fallback, dessine chaque polygone séparément
+            for (path_idx, sub_idx) in shape_keys:
+                hist = shape_history.get((path_idx, sub_idx), None)
+                if hist is not None:
+                    pts = hist.get('extrusion_points', hist.get('simplified_points', []))
+                    if len(pts) >= 3:
+                        points_str = ' '.join(f"{x},{y}" for x, y in pts)
+                        engraved = hist.get('engraved', True)
+                        style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
+                        polygon_elem = ET.Element('polygon', {
+                            'points': points_str,
+                            'style': style,
+                            'data-pathidx': str(path_idx),
+                            'data-subidx': str(sub_idx)
+                        })
+                        group.append(polygon_elem)
     else:
         print("Aucune shape_history fournie pour générer le SVG de résumé.")
+
+    # Écriture du nouveau fichier SVG (toujours à la fin, une seule fois)
+    new_tree = ET.ElementTree(new_root)
+    new_tree.write(output_svg_name, encoding='utf-8', xml_declaration=True)
+    print(f"SVG généré : {output_svg_name}")
 
 
 def flatten_cq_solids(obj):
