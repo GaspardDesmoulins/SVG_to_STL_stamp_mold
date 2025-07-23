@@ -450,7 +450,7 @@ def try_apply_engraving(engraving_obj, method_label, group_idx, mold, base_thick
     return False, mold
 
 def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
-                      original_svg_path=None, shape_keys=None):
+                      original_svg_path=None):
     """
     Grave les polygones sur le moule, met à jour shape_history['engraved'] pour chaque shape.
     Retourne le moule gravé et la liste des indices gravés.
@@ -460,10 +460,11 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     engraved_indices = []
     grouped_wires = group_wires_by_inclusion(svg_wires, shape_history)
     wire_to_shape = shape_history.get('wire_to_shape', {})
+
     for group_idx, wire_group in grouped_wires:
         try:
             print(f"\n--- Gravure polygone {group_idx} (groupe de {len(wire_group)} wires) ---")
-            # Affichage d'informations sur chaque wire du groupe
+            # Affichage d'informations sur chaque wire du groupe pour le débogage
             for wire_index, wire in enumerate(wire_group):
                 try:
                     global_wire_index = svg_wires.index(wire)
@@ -476,6 +477,7 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                 else:
                     print(f"  Wire {wire_index} (global idx {global_wire_index}): [shape SVG non trouvée]")
                 print(f"    isClosed: {wire.IsClosed()}, isValid: {wire.isValid()}, nb sommets: {len(list(wire.Vertices()))}")
+
             # 1. Tenter d'abord le loft avec dépouille
             draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
             engraving_loft = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
@@ -522,9 +524,21 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
             print(f"Erreur lors de la gravure du groupe {group_idx}: {e}")
 
         # Génération du SVG de résumé après chaque étape de gravure
-        if original_svg_path is not None and shape_keys is not None:
+        if original_svg_path is not None:
+            # Récupération des shape_keys pour le groupe de wires actuel.
+            # Cela permet de ne dessiner que les polygones de l'étape en cours dans le SVG de résumé.
+            current_shape_keys = []
+            for w in wire_group:
+                global_wire_index = get_global_wire_index(w, svg_wires)
+                if global_wire_index is not None and global_wire_index in wire_to_shape:
+                    current_shape_keys.append(wire_to_shape[global_wire_index])
+            
+            if current_shape_keys:
                 summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
-                generate_summary_svg(original_svg_path, shape_keys, summary_svg_path, shape_history)              
+                generate_summary_svg(original_svg_path, current_shape_keys, summary_svg_path, shape_history)
+            else:
+                print(f"Aucune shape_key trouvée pour le groupe {group_idx}, le SVG de résumé n'a pas été généré.")
+                
     return mold, engraved_indices
 
 def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, border_height=BORDER_HEIGHT,
@@ -553,7 +567,7 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
 
     mold, engraved_indices = engrave_polygons(
         mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
-        original_svg_path=svg_file, shape_keys=shape_keys
+        original_svg_path=svg_file
     )
 
     # Suppression du dossier de debug si demandé
@@ -565,21 +579,25 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
 def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_history=None):
     """
     Génère un SVG de résumé en dessinant explicitement chaque shape (polygone) à partir des points simplifiés de shape_history,
-    coloré en noir si engraved, rouge sinon.
+    coloré en noir si engraved, rouge sinon. Le SVG généré est vierge et ne contient que les polygones de l'étape.
     """
-    tree = ET.parse(original_svg_path)
-    root = tree.getroot()
-
-    # Suppression des éléments non désirés
-    for bad_tag in ['metadata', 'desc', 'title']:
-        for elem in root.findall(f'.//{bad_tag}'):
-            parent = find_parent(root, elem)
-            if parent is not None:
-                parent.remove(elem)
+    # Lit l'ancien SVG pour récupérer ses attributs (width, height, viewBox)
+    original_tree = ET.parse(original_svg_path)
+    original_root = original_tree.getroot()
+    
+    # Crée un nouvel élément SVG racine, en copiant les attributs de l'original
+    # et en s'assurant que le namespace est bien défini.
+    ns = 'http://www.w3.org/2000/svg'
+    ET.register_namespace('', ns) # Namespace par défaut
+    new_root_attribs = original_root.attrib.copy()
+    # Ajout du namespace xmlns s'il n'est pas déjà présent
+    if 'xmlns' not in new_root_attribs:
+        new_root_attribs['xmlns'] = ns
+    new_root = ET.Element('svg', new_root_attribs)
 
     # Création d'un groupe pour les polygones sélectionnés
     group = ET.Element('g', {'id': 'summary_polygons'})
-    root.append(group)
+    new_root.append(group)
 
     # Ajout des polygones colorés à partir des points simplifiés
     if shape_history is not None:
@@ -589,7 +607,7 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                 pts = hist.get('simplified_points', [])
                 if len(pts) >= 3:
                     points_str = ' '.join(f"{x},{y}" for x, y in pts)
-                    engraved = hist.get('engraved', False)
+                    engraved = hist.get('engraved', True) # Par défaut on considère gravé pour le résumé d'étape
                     style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
                     polygon_elem = ET.Element('polygon', {
                         'points': points_str,
@@ -600,7 +618,8 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                     group.append(polygon_elem)
 
         # Écriture du nouveau fichier SVG
-        tree.write(output_svg_name, encoding='utf-8', xml_declaration=True)
+        new_tree = ET.ElementTree(new_root)
+        new_tree.write(output_svg_name, encoding='utf-8', xml_declaration=True)
         print(f"SVG généré : {output_svg_name}")
     else:
         print("Aucune shape_history fournie pour générer le SVG de résumé.")

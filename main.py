@@ -42,8 +42,11 @@ if __name__ == "__main__":
         # Génération du SVG de résumé avec couleurs distinctes
         all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
         if all_shape_keys:
-            generate_summary_svg(args.svg, all_shape_keys, f'summary_{args.svg.split("/")[-1]}', shape_history=shape_history)
-            print("SVG de résumé généré avec couleurs selon le statut de gravure.")
+            svg_basename = os.path.splitext(os.path.basename(args.svg))[0]
+            debug_dir = f"debug_{svg_basename}"
+            summary_path = os.path.join(debug_dir, f'summary_{svg_basename}_final.svg')
+            generate_summary_svg(args.svg, all_shape_keys, summary_path, shape_history=shape_history)
+            print(f"SVG de résumé final généré : {summary_path}")
         else:
             print("Aucun polygone détecté, pas de SVG de visualisation généré.")
     except ValueError as e:

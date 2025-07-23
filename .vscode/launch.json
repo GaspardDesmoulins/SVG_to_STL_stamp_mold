@@ -12,7 +12,7 @@
         "--size",
         "40",
         "--output",
-        "${workspaceFolder}/svgs/moule_chat.stl",
+        "${workspaceFolder}/stls/moule_chat.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"
@@ -28,7 +28,7 @@
         "--size",
         "40",
         "--output",
-        "${workspaceFolder}/svgs/moule_anneau.stl",
+        "${workspaceFolder}/stls/moule_anneau.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"
@@ -44,7 +44,7 @@
         "--size",
         "200",
         "--output",
-        "${workspaceFolder}/svgs/moule_anneau_complexe.stl",
+        "${workspaceFolder}/stls/moule_anneau_complexe.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"
@@ -60,7 +60,7 @@
         "--size",
         "40",
         "--output",
-        "${workspaceFolder}/svgs/moule_anneaux_imbriqués.stl",
+        "${workspaceFolder}/stls/moule_anneaux_imbriqués.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"
