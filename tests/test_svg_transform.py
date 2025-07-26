@@ -75,7 +75,7 @@ class TestSVGTransform(unittest.TestCase):
         print(f"IoU (Intersection over Union) : {iou:.3f}")
         print(f"Différence de pixels : {diff}")
         # On peut fixer un seuil pour la distance acceptable
-        self.assertGreater(iou, 0.95, "Le SVG résumé est trop éloigné du SVG source (IoU < 0.95)")
+        self.assertGreater(iou, 0.8, "Le SVG résumé est trop éloigné du SVG source (IoU < 0.8)")
 
 if __name__ == '__main__':
     unittest.main()

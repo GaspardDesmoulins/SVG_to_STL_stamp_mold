@@ -198,6 +198,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
     Peut forcer l'extraction de tous les contours (utile pour les SVG Affinity Designer).
     Retourne la liste des wires et l'historique des shapes.
     """
+    print("[DEBUG svg_to_cadquery_wires] Début extraction des paths SVG...")
     svgfile = Path(svg_file)
     paths, attributes, svg_attr = svg2paths2(str(svgfile.absolute()))
     all_points = []
@@ -297,6 +298,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                     'simplified_points': simplified_points,
                     'cq_wire_index': None,
                 }
+                print(f"[DEBUG svg_to_cadquery_wires] Path {path_idx}, subpath {sub_idx}, nb_points: {len(simplified_points)}, type: path, attr: {svgpathtools_attr}")
 
     # --- Ajout du support des ellipses SVG ---
     tree = ET.parse(str(svgfile.absolute()))
@@ -342,9 +344,14 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                     'simplified_points': ellipse_points,
                     'cq_wire_index': None,
                 }
+                print(f"[DEBUG svg_to_cadquery_wires] Ellipse {ellipse_count}, nb_points: {len(ellipse_points)}, attr: {elem.attrib}")
                 ellipse_count += 1
             except Exception as e:
                 print(f"Erreur lors de l'extraction d'une ellipse : {e}")
+    print(f"[DEBUG svg_to_cadquery_wires] shape_history keys: {list(shape_history.keys())}")
+    for k, v in shape_history.items():
+        if isinstance(k, tuple):
+            print(f"[DEBUG svg_to_cadquery_wires] shape_history[{k}]: nb_points={len(v.get('simplified_points', []))}, type={k[0]}")
 
     if not all_points:
         raise ValueError("No SVG paths found with fill or stroke to create mold.")
@@ -623,7 +630,8 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
             
             if current_shape_keys:
                 summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
-                generate_summary_svg(original_svg_path, current_shape_keys, summary_svg_path, shape_history)
+                # Correction : toujours passer shape_history
+                generate_summary_svg(original_svg_path, current_shape_keys, summary_svg_path, shape_history=shape_history)
             else:
                 print(f"Aucune shape_key trouvée pour le groupe {group_idx}, le SVG de résumé n'a pas été généré.")
                 
@@ -669,6 +677,13 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     Génère un SVG de résumé en dessinant explicitement chaque shape (polygone) à partir des points simplifiés de shape_history,
     coloré en noir si engraved, rouge sinon. Le SVG généré est vierge et ne contient que les polygones de l'étape.
     """
+    print(f"[DEBUG generate_summary_svg] Génération du résumé SVG pour {output_svg_name}")
+    print(f"[DEBUG generate_summary_svg] shape_keys à dessiner: {shape_keys}")
+    if shape_history is not None:
+        for k in shape_keys:
+            hist = shape_history.get(k, None)
+            if hist is not None:
+                print(f"  - shape_key: {k}, nb_points: {len(hist.get('simplified_points', []))}, attr: {hist.get('svg_attr', {})}")
     # Lit l'ancien SVG pour récupérer ses attributs (width, height, viewBox)
     original_tree = ET.parse(original_svg_path)
     original_root = original_tree.getroot()
