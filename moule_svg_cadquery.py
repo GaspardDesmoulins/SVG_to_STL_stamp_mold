@@ -323,53 +323,6 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                 }
                 print(f"[DEBUG svg_to_cadquery_wires] Path {path_idx}, subpath {sub_idx}, nb_points: {len(simplified_points)}, type: path, attr: {svgpathtools_attr}")
 
-    # --- Ajout du support des ellipses SVG ---
-    tree = ET.parse(str(svgfile.absolute()))
-    root = tree.getroot()
-    ellipse_count = 0
-    for elem in root.iter():
-        if strip_namespace(elem.tag) == 'ellipse':
-            try:
-                fill = elem.attrib.get('fill', None)
-                stroke = elem.attrib.get('stroke', None)
-                if not force_all_contours:
-                    def is_none_or_transparent(val):
-                        if val is None:
-                            return False
-                        val = val.strip().lower()
-                        return val in ['none', 'transparent']
-                    if is_none_or_transparent(fill) and is_none_or_transparent(stroke):
-                        continue
-                cx = float(elem.attrib.get('cx', '0'))
-                cy = float(elem.attrib.get('cy', '0'))
-                rx = float(elem.attrib.get('rx', '0'))
-                ry = float(elem.attrib.get('ry', '0'))
-                if rx == 0 or ry == 0:
-                    continue
-                n_pts = 60
-                ellipse_points = []
-                for i in range(n_pts):
-                    theta = 2 * math.pi * i / n_pts
-                    x = cx + rx * math.cos(theta)
-                    y = cy + ry * math.sin(theta)
-                    ellipse_points.append([x, y])
-                ellipse_points.append(ellipse_points[0])
-                all_points.extend(ellipse_points)
-                shapes_data.append(ellipse_points)
-                ellipse_key = ("ellipse", ellipse_count)
-                shape_keys.append(ellipse_key)
-                shape_history[ellipse_key] = {
-                    'svg_path_idx': "ellipse",
-                    'svg_sub_idx': ellipse_count,
-                    'svg_attr': dict(elem.attrib),
-                    'sampled_points': ellipse_points,
-                    'simplified_points': ellipse_points,
-                    'cq_wire_index': None,
-                }
-                print(f"[DEBUG svg_to_cadquery_wires] Ellipse {ellipse_count}, nb_points: {len(ellipse_points)}, attr: {elem.attrib}")
-                ellipse_count += 1
-            except Exception as e:
-                print(f"Erreur lors de l'extraction d'une ellipse : {e}")
     print(f"[DEBUG svg_to_cadquery_wires] shape_history keys: {list(shape_history.keys())}")
     for k, v in shape_history.items():
         if isinstance(k, tuple):
