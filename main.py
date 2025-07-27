@@ -37,18 +37,6 @@ if __name__ == "__main__":
         # Export final
         cq.exporters.export(mold, args.output)
         print(f"Moule CadQuery généré : {args.output}")
-        engraved_shape_keys = [k for k, v in shape_history.items() if isinstance(k, tuple) and v.get('engraved')]
-        ignored_shape_keys = [k for k, v in shape_history.items() if isinstance(k, tuple) and not v.get('engraved')]
-        # Génération du SVG de résumé avec couleurs distinctes
-        all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
-        if all_shape_keys:
-            svg_basename = os.path.splitext(os.path.basename(args.svg))[0]
-            debug_dir = f"debug_{svg_basename}"
-            summary_path = os.path.join(debug_dir, f'summary_{svg_basename}_final.svg')
-            generate_summary_svg(args.svg, all_shape_keys, summary_path, shape_history=shape_history)
-            print(f"SVG de résumé final généré : {summary_path}")
-        else:
-            print("Aucun polygone détecté, pas de SVG de visualisation généré.")
     except ValueError as e:
         print(f"Erreur lors de la génération du moule : {e}")
 

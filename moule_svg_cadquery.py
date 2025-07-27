@@ -624,6 +624,15 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
         original_svg_path=svg_file
     )
 
+    # Génération d'un SVG de résumé global de tous les éléments gravés
+    engraved_shape_keys = [k for k in shape_history if isinstance(k, tuple) and shape_history[k].get('engraved', False)]
+    if engraved_shape_keys:
+        global_summary_svg = os.path.join(debug_dir, f"summary_{svg_basename}_final.svg")
+        generate_summary_svg(svg_file, engraved_shape_keys, global_summary_svg, shape_history=shape_history)
+        print(f"Résumé global SVG généré : {global_summary_svg}")
+    else:
+        print("Aucun élément gravé, pas de SVG de résumé global généré.")
+
     # Suppression du dossier de debug si demandé
     if not keep_debug_files:
         shutil.rmtree(debug_dir, ignore_errors=True)
