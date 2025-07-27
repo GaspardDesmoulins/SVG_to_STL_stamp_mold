@@ -624,14 +624,14 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
         original_svg_path=svg_file
     )
 
-    # Génération d'un SVG de résumé global de tous les éléments gravés
-    engraved_shape_keys = [k for k in shape_history if isinstance(k, tuple) and shape_history[k].get('engraved', False)]
-    if engraved_shape_keys:
+    # Génération d'un SVG de résumé global de toutes les formes (gravées ou non)
+    all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
+    if all_shape_keys:
         global_summary_svg = os.path.join(debug_dir, f"summary_{svg_basename}_final.svg")
-        generate_summary_svg(svg_file, engraved_shape_keys, global_summary_svg, shape_history=shape_history)
+        generate_summary_svg(svg_file, all_shape_keys, global_summary_svg, shape_history=shape_history)
         print(f"Résumé global SVG généré : {global_summary_svg}")
     else:
-        print("Aucun élément gravé, pas de SVG de résumé global généré.")
+        print("Aucune forme trouvée, pas de SVG de résumé global généré.")
 
     # Suppression du dossier de debug si demandé
     if not keep_debug_files:
@@ -655,69 +655,65 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     original_tree = ET.parse(original_svg_path)
     original_root = original_tree.getroot()
     
-    # Crée un nouvel élément SVG racine, en copiant les attributs de l'original
-    # et en s'assurant que le namespace est bien défini.
+    # Crée un nouvel élément SVG racine, en copiant explicitement viewBox, width, height, xmlns
     ns = 'http://www.w3.org/2000/svg'
     ET.register_namespace('', ns) # Namespace par défaut
-    new_root_attribs = original_root.attrib.copy()
-    # Ajout du namespace xmlns s'il n'est pas déjà présent
-    if 'xmlns' not in new_root_attribs:
-        new_root_attribs['xmlns'] = ns
+    new_root_attribs = {}
+    # Copie viewBox, width, height si présents
+    for attr in ['viewBox', 'width', 'height']:
+        if attr in original_root.attrib:
+            new_root_attribs[attr] = original_root.attrib[attr]
+    # Ajoute le namespace
+    new_root_attribs['xmlns'] = ns
     new_root = ET.Element('svg', new_root_attribs)
 
     # Création d'un groupe pour les polygones sélectionnés
     group = ET.Element('g', {'id': 'summary_polygons'})
     new_root.append(group)
 
-    # --- Nouvelle logique : utiliser les points recalés et mis à l'échelle (ceux utilisés pour l'extrusion du moule) ---
-    # Cela garantit que la position des polygones dans le SVG de résumé correspond à celle sur le moule.
+    # Nouvelle logique : dessiner tous les paths, même non gravés, en rouge (remplissage) si la gravure a échoué.
     if shape_history is not None:
-        # Récupère les polygones recalés et mis à l'échelle (ceux utilisés pour l'extrusion)
-        polygons = []
+        from collections import defaultdict
+        grouped = defaultdict(list)
         for (path_idx, sub_idx) in shape_keys:
-            hist = shape_history.get((path_idx, sub_idx), None)
-            if hist is not None:
-                # On utilise les points filtrés et mis à l'échelle, qui correspondent à la géométrie du moule
-                pts = hist.get('extrusion_points', hist.get('simplified_points', []))
-                if len(pts) >= 3:
-                    polygons.append(pts)
-        if len(polygons) >= 2:
-            # Génère un seul path SVG combinant les deux polygones (extérieur et intérieur)
-            # Utilise la règle de remplissage 'evenodd' pour afficher l'anneau
-            def points_to_svg_path(pts):
-                # Convertit une liste de points en commande path SVG
-                return 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z'
-            path_d = ''
-            for pts in polygons:
-                path_d += points_to_svg_path(pts) + ' '
-            # Style : noir si gravé, rouge sinon (on prend le statut du polygone extérieur)
-            engraved = shape_history.get(shape_keys[0], {}).get('engraved', True)
-            style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
-            path_elem = ET.Element('path', {
-                'd': path_d.strip(),
-                'style': style,
-                'fill-rule': 'evenodd',
-                'data-pathidx': str(shape_keys[0][0]),
-                'data-subidx': str(shape_keys[0][1])
-            })
-            group.append(path_elem)
-        else:
-            # Cas général : fallback, dessine chaque polygone séparément
-            for (path_idx, sub_idx) in shape_keys:
-                hist = shape_history.get((path_idx, sub_idx), None)
+            grouped[path_idx].append((path_idx, sub_idx))
+        for path_idx, subkeys in grouped.items():
+            paths_d = ''
+            engraved = True  # Par défaut
+            for (pidx, sidx) in subkeys:
+                hist = shape_history.get((pidx, sidx), None)
                 if hist is not None:
-                    pts = hist.get('extrusion_points', hist.get('simplified_points', []))
-                    if len(pts) >= 3:
-                        points_str = ' '.join(f"{x},{y}" for x, y in pts)
-                        engraved = hist.get('engraved', True)
-                        style = 'fill:black;stroke:black;stroke-width:1' if engraved else 'fill:red;stroke:black;stroke-width:1'
-                        polygon_elem = ET.Element('polygon', {
-                            'points': points_str,
-                            'style': style,
-                            'data-pathidx': str(path_idx),
-                            'data-subidx': str(sub_idx)
-                        })
-                        group.append(polygon_elem)
+                    # On tente d'utiliser extrusion_points, sinon simplified_points, sinon sampled_points
+                    pts = hist.get('extrusion_points')
+                    if not pts or len(pts) < 3:
+                        pts = hist.get('simplified_points')
+                    if not pts or len(pts) < 3:
+                        pts = hist.get('sampled_points')
+                    if pts and len(pts) >= 3:
+                        # On prend le statut engraved du contour extérieur (premier subkey)
+                        if (pidx, sidx) == subkeys[0]:
+                            engraved = hist.get('engraved', False)
+                        paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z '
+            if paths_d:
+                if engraved:
+                    style = 'fill:black;stroke:black;stroke-width:1'
+                else:
+                    style = 'fill:red;stroke:red;stroke-width:1'
+                path_elem = ET.Element('path', {
+                    'd': paths_d.strip(),
+                    'style': style,
+                    'fill-rule': 'evenodd',
+                    'data-pathidx': str(path_idx),
+                })
+                group.append(path_elem)
+            else:
+                # Si aucun point utilisable, on génère un path vide en rouge (stroke)
+                path_elem = ET.Element('path', {
+                    'd': '',
+                    'style': 'fill:none;stroke:red;stroke-width:2',
+                    'data-pathidx': str(path_idx),
+                })
+                group.append(path_elem)
     else:
         print("Aucune shape_history fournie pour générer le SVG de résumé.")
 
