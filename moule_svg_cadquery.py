@@ -1,16 +1,26 @@
+import os
+import shutil
+import re
+import logging
+import math
 import cadquery as cq
 from svgpathtools import svg2paths2, parse_path, Path as Svg_Path, Line, CubicBezier, QuadraticBezier, Arc
 import numpy as np
 from pathlib import Path
-import os
-import shutil
 from xml.etree import ElementTree as ET
-import re
 from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon as ShapelyPolygon
-import math
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
+
+# --- Logger configuration ---
+logger = logging.getLogger("moule_svg_cadquery")
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 def parse_transform(transform_str):
     """
@@ -325,7 +335,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
     Peut forcer l'extraction de tous les contours (utile pour les SVG Affinity Designer).
     Retourne la liste des wires et l'historique des shapes.
     """
-    print("[DEBUG svg_to_cadquery_wires] Début extraction des paths SVG...")
+    logger.info("Début extraction des paths SVG...")
     svgfile = Path(svg_file)
     paths, attributes, svg_attr = svg2paths2(str(svgfile.absolute()))
     all_points = []
@@ -389,7 +399,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
     for path_idx, (svgpathtools_path, svgpathtools_attr) in enumerate(zip(paths, attributes)):
         if not is_visible(svgpathtools_attr):
             continue
-        print(f"\n--- Path {path_idx} ---")
+        logger.debug(f"--- Path {path_idx} ---")
         # Récupère la matrice de transformation cumulée pour ce path
         if path_idx < len(path_with_transform):
             cumulative_transform = path_with_transform[path_idx][1]
@@ -397,7 +407,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
             cumulative_transform = np.eye(3)
         # Extraction des sous-chemins (subpaths) du path SVG
         subpaths = extract_subpaths(svgpathtools_path, sampling_default)
-        print(f"Subpaths {len(subpaths)}")
+        logger.debug(f"Subpaths {len(subpaths)}")
         for sub_idx, sampled_points in enumerate(subpaths):
             if sampled_points:
                 # --- Application de la matrice de transformation à chaque point du path ---
@@ -423,14 +433,15 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                     'simplified_points': simplified_points,
                     'cq_wire_index': None,
                 }
-                print(f"[DEBUG svg_to_cadquery_wires] Path {path_idx}, subpath {sub_idx}, nb_points: {len(simplified_points)}, type: path, attr: {svgpathtools_attr}")
+                logger.debug(f"Path {path_idx}, subpath {sub_idx}, nb_points: {len(simplified_points)}, type: path, attr: {svgpathtools_attr}")
 
-    print(f"[DEBUG svg_to_cadquery_wires] shape_history keys: {list(shape_history.keys())}")
+    logger.debug(f"shape_history keys: {list(shape_history.keys())}")
     for k, v in shape_history.items():
         if isinstance(k, tuple):
-            print(f"[DEBUG svg_to_cadquery_wires] shape_history[{k}]: nb_points={len(v.get('simplified_points', []))}, type={k[0]}")
+            logger.debug(f"shape_history[{k}]: nb_points={len(v.get('simplified_points', []))}, type={k[0]}")
 
     if not all_points:
+        logger.error("Aucun chemin SVG trouvé avec fill ou stroke pour créer le moule.")
         raise ValueError("No SVG paths found with fill or stroke to create mold.")
 
     xs = [pt[0] for pt in all_points]
@@ -520,25 +531,26 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         base_offset_wires = base_outline_wire.offset2D(margin, "arc")
         if isinstance(base_offset_wires, list) and len(base_offset_wires) > 0:
             base_outline_wire = base_offset_wires[0]
-            print(f"Offset de {margin}mm appliqué à l'enveloppe convexe pour la marge.")
+            logger.info(f"Offset de {margin}mm appliqué à l'enveloppe convexe pour la marge.")
         else:
-            print(f"Offset de {margin}mm échoué, utilisation de l'enveloppe convexe brute.")
+            logger.warning(f"Offset de {margin}mm échoué, utilisation de l'enveloppe convexe brute.")
     except Exception as e:
-        print(f"Erreur lors de l'offset de l'enveloppe convexe : {e}. Utilisation de l'enveloppe brute.")
+        logger.warning(f"Erreur lors de l'offset de l'enveloppe convexe : {e}. Utilisation de l'enveloppe brute.")
 
     # Diagnostic wire
-    print(f"[DEBUG] base_outline_wire type: {type(base_outline_wire)}, isValid: {base_outline_wire.isValid() if hasattr(base_outline_wire, 'isValid') else 'N/A'}, isClosed: {base_outline_wire.IsClosed() if hasattr(base_outline_wire, 'IsClosed') else 'N/A'}")
+    logger.debug(f"base_outline_wire type: {type(base_outline_wire)}, isValid: {base_outline_wire.isValid() if hasattr(base_outline_wire, 'isValid') else 'N/A'}, isClosed: {base_outline_wire.IsClosed() if hasattr(base_outline_wire, 'IsClosed') else 'N/A'}")
     if not base_outline_wire.isValid() or not base_outline_wire.IsClosed():
-        print("[DEBUG] Wire offset non valide ou non fermé, tentative de reconstruction via makePolygon.")
+        logger.debug("Wire offset non valide ou non fermé, tentative de reconstruction via makePolygon.")
         pts = [v.toTuple() for v in base_outline_wire.Vertices()]
         if pts[0] != pts[-1]:
             pts.append(pts[0])
         base_outline_wire = cq.Wire.makePolygon([cq.Vector(x, y) for x, y in pts])
-        print(f"[DEBUG] Wire reconstruit: isValid: {base_outline_wire.isValid()}, isClosed: {base_outline_wire.IsClosed()}")
+        logger.debug(f"Wire reconstruit: isValid: {base_outline_wire.isValid()}, isClosed: {base_outline_wire.IsClosed()}")
 
     # Création de la base
     base_wp = cq.Workplane("XY").add(base_outline_wire).toPending().extrude(base_thickness)
     if not (base_wp.val().isValid() and base_wp.val().ShapeType() == "Solid"):
+        logger.error("La base du moule (contour SVG) n'est pas un solide valide.")
         raise ValueError("La base du moule (contour SVG) n'est pas un solide valide.")
     base_shape = base_wp.val()
 
@@ -547,12 +559,12 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         border_outer_wires = base_outline_wire.offset2D(border_thickness, "arc")
         if isinstance(border_outer_wires, list) and len(border_outer_wires) > 0:
             border_outer_wire = border_outer_wires[0]
-            print(f"Offset extérieur de {border_thickness}mm appliqué pour la bordure.")
+            logger.info(f"Offset extérieur de {border_thickness}mm appliqué pour la bordure.")
         else:
-            print(f"Offset extérieur échoué, pas de bordure.")
+            logger.warning(f"Offset extérieur échoué, pas de bordure.")
             border_outer_wire = None
     except Exception as e:
-        print(f"Erreur lors de l'offset extérieur pour la bordure : {e}. Pas de bordure.")
+        logger.warning(f"Erreur lors de l'offset extérieur pour la bordure : {e}. Pas de bordure.")
         border_outer_wire = None
 
     border_inner_wire = base_outline_wire  # L'intérieur de la bordure est la base (avec marge)
@@ -568,16 +580,16 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         border_ring = border_outer_shape.cut(border_inner_shape)
         # Fusionne base et anneau
         base_mold = base_shape.fuse(border_ring)
-        print("Bordure en anneau générée et fusionnée à la base.")
+        logger.info("Bordure en anneau générée et fusionnée à la base.")
     else:
         base_mold = base_shape
-        print("Pas de bordure générée, seule la base est utilisée.")
+        logger.info("Pas de bordure générée, seule la base est utilisée.")
 
     # --- Export STL de la base avant gravure dans debug_stl/ ---
     base_stl_path = os.path.join(debug_dir, os.path.basename(base_stl_name))
     if export_base_stl:
         cq.exporters.export(base_mold, base_stl_path)
-        print(f"STL de la base (avec bordure) exporté : {base_stl_path}")
+        logger.info(f"STL de la base (avec bordure) exporté : {base_stl_path}")
     return base_mold
 
 def try_apply_engraving(engraving_obj, method_label, group_idx, mold, base_thickness, export_steps, debug_dir, engraved_indices):
@@ -586,7 +598,7 @@ def try_apply_engraving(engraving_obj, method_label, group_idx, mold, base_thick
     Retourne (success, new_mold)
     """
     engravings = flatten_cq_solids(engraving_obj)
-    print(f"[DEBUG] Types des objets retournés par flatten_cq_solids ({method_label}): {[type(e) for e in engravings]}")
+    logger.debug(f"Types des objets retournés par flatten_cq_solids ({method_label}): {[type(e) for e in engravings]}")
     for engraving_solid in engravings:
         if hasattr(engraving_solid, 'isValid') and engraving_solid.isValid() and hasattr(engraving_solid, 'ShapeType') and engraving_solid.ShapeType() in ["Solid", "Compound"]:
             engraving_solid = engraving_solid.translate((0, 0, base_thickness))
@@ -595,12 +607,12 @@ def try_apply_engraving(engraving_obj, method_label, group_idx, mold, base_thick
                 if export_steps:
                     step_stl_path = os.path.join(debug_dir, f"step_{group_idx}.stl")
                     cq.exporters.export(new_mold, step_stl_path)
-                    print(f"Export STL intermédiaire réussi ({method_label}) : {step_stl_path}")
+                    logger.info(f"Export STL intermédiaire réussi ({method_label}) : {step_stl_path}")
                 engraved_indices.append(group_idx)
-                print(f"Groupe {group_idx} gravé avec succès ({method_label}).")
+                logger.info(f"Groupe {group_idx} gravé avec succès ({method_label}).")
                 return True, new_mold
             except Exception as ce:
-                print(f"Erreur lors du cut avec l'extrusion du groupe {group_idx} ({method_label}) : {ce}")
+                logger.warning(f"Erreur lors du cut avec l'extrusion du groupe {group_idx} ({method_label}) : {ce}")
     return False, mold
 
 def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
@@ -615,11 +627,10 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     grouped_wires = group_wires_by_inclusion(svg_wires, shape_history)
     wire_to_shape = shape_history.get('wire_to_shape', {})
 
-    # Correction : chaque wire (même rect, ellipse, etc.) doit générer son propre groupe et son propre summary SVG
     group_counter = 0
     for group_idx, wire_group in grouped_wires:
         try:
-            print(f"\n--- Gravure polygone {group_idx} (groupe de {len(wire_group)} wires) ---")
+            logger.info(f"--- Gravure polygone {group_idx} (groupe de {len(wire_group)} wires) ---")
             for wire_index, wire in enumerate(wire_group):
                 try:
                     global_wire_index = svg_wires.index(wire)
@@ -628,48 +639,48 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                 shape_info = wire_to_shape.get(global_wire_index, None)
                 if shape_info is not None:
                     hist = shape_history[shape_info]
-                    print(f"  Wire {wire_index} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
+                    logger.debug(f"  Wire {wire_index} (global idx {global_wire_index}): SVG path_idx={hist['svg_path_idx']}, sub_idx={hist['svg_sub_idx']}, nb_points={len(hist['simplified_points'])}")
                 else:
-                    print(f"  Wire {wire_index} (global idx {global_wire_index}): [shape SVG non trouvée]")
-                print(f"    isClosed: {wire.IsClosed()}, isValid: {wire.isValid()}, nb sommets: {len(list(wire.Vertices()))}")
+                    logger.debug(f"  Wire {wire_index} (global idx {global_wire_index}): [shape SVG non trouvée]")
+                logger.debug(f"    isClosed: {wire.IsClosed()}, isValid: {wire.isValid()}, nb sommets: {len(list(wire.Vertices()))}")
 
             # 1. Tenter d'abord le loft avec dépouille
             draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
             engraving_loft = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
-            print(f"[DEBUG] Type engraving retourné par loft_with_draft: {type(engraving_loft)}")
+            logger.debug(f"Type engraving retourné par loft_with_draft: {type(engraving_loft)}")
             success, mold = try_apply_engraving(
                 engraving_loft, "loft", group_counter,
                 mold, base_thickness, export_steps,
                 debug_dir, engraved_indices
             )
             if not success:
-                print(f"Warning: Loft du groupe {group_counter} n'a pas produit de solide valide.")
+                logger.warning(f"Loft du groupe {group_counter} n'a pas produit de solide valide.")
                 # 2. Si le loft échoue, tenter l'extrusion directe
-                print(f"--- Tentative d'extrusion directe pour le groupe {group_counter} ---")
+                logger.info(f"--- Tentative d'extrusion directe pour le groupe {group_counter} ---")
                 try:
                     face_result = cq.Face.makeFromWires(wire_group[0], wire_group[1:])
                 except Exception as e:
-                    print(f"Erreur makeFromWires sur groupe {group_counter}: {e}")
+                    logger.warning(f"Erreur makeFromWires sur groupe {group_counter}: {e}")
                     mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
                     group_counter += 1
                     continue
                 if isinstance(face_result, list):
                     if not face_result:
-                        print(f"Polygone {group_counter} : makeFromWires a retourné une liste vide.")
+                        logger.warning(f"Polygone {group_counter} : makeFromWires a retourné une liste vide.")
                         group_counter += 1
                         continue
                     face = face_result[0]
                 else:
                     face = face_result
                 engraving_extrude = cq.Workplane("XY").add(face).extrude(-engrave_depth)
-                print(f"[DEBUG] Type engraving après extrusion directe: {type(engraving_extrude)}")
+                logger.debug(f"Type engraving après extrusion directe: {type(engraving_extrude)}")
                 success, mold = try_apply_engraving(
                     engraving_extrude, "extrusion", group_counter,
                     mold, base_thickness, export_steps,
                     debug_dir, engraved_indices
                 )
                 if not success:
-                    print(f"Warning: Extrusion du groupe {group_counter} n'a pas produit de solide valide.")
+                    logger.warning(f"Extrusion du groupe {group_counter} n'a pas produit de solide valide.")
                     mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
                     raise ValueError(f"Le groupe {group_counter} n'a pas pu être gravé avec succès.")
                 else:
@@ -677,23 +688,20 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
             else:
                 mark_wires_engraved(wire_group, True, svg_wires, shape_history, group_counter)
         except Exception as e:
-            print(f"Erreur lors de la gravure du groupe {group_counter}: {e}")
+            logger.error(f"Erreur lors de la gravure du groupe {group_counter}: {e}")
 
         # Génération du SVG de résumé après chaque étape de gravure
         if original_svg_path is not None:
-            # Correction : chaque wire_group correspond à un seul shape_key (un seul polygone)
             current_shape_keys = []
             for w in wire_group:
                 global_wire_index = get_global_wire_index(w, svg_wires)
                 if global_wire_index is not None and global_wire_index in wire_to_shape:
                     current_shape_keys.append(wire_to_shape[global_wire_index])
-            # Pour garantir un fichier par forme, on ne prend que le premier shape_key du groupe (un seul polygone)
             if current_shape_keys:
                 summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
-                # Correction : toujours passer shape_history
                 generate_summary_svg(original_svg_path, current_shape_keys, summary_svg_path, shape_history=shape_history)
             else:
-                print(f"Aucune shape_key trouvée pour le groupe {group_counter}, le SVG de résumé n'a pas été généré.")
+                logger.warning(f"Aucune shape_key trouvée pour le groupe {group_counter}, le SVG de résumé n'a pas été généré.")
         group_counter += 1
     return mold, engraved_indices
 
@@ -706,7 +714,9 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     debug_dir = f"debug_{svg_basename}"
     os.makedirs(debug_dir, exist_ok=True)
 
+    logger.info(f"Normalisation du SVG : {svg_file}")
     normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
+    logger.info(f"Flatten des transformations SVG : {normalized_svg_file}")
     simplified_svg_file = flatten_svg_transforms(normalized_svg_file, debug_dir=debug_dir)
     svg_wires, shape_history = svg_to_cadquery_wires(simplified_svg_file, max_dim)
 
@@ -732,9 +742,9 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     if all_shape_keys:
         global_summary_svg = os.path.join(debug_dir, f"summary_{svg_basename}_final.svg")
         generate_summary_svg(svg_file, all_shape_keys, global_summary_svg, shape_history=shape_history)
-        print(f"Résumé global SVG généré : {global_summary_svg}")
+        logger.info(f"Résumé global SVG généré : {global_summary_svg}")
     else:
-        print("Aucune forme trouvée, pas de SVG de résumé global généré.")
+        logger.warning("Aucune forme trouvée, pas de SVG de résumé global généré.")
 
     # Suppression du dossier de debug si demandé
     if not keep_debug_files:
@@ -747,13 +757,13 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     Génère un SVG de résumé en dessinant explicitement chaque shape (polygone) à partir des points simplifiés de shape_history,
     coloré en noir si engraved, rouge sinon. Le SVG généré est vierge et ne contient que les polygones de l'étape.
     """
-    print(f"[DEBUG generate_summary_svg] Génération du résumé SVG pour {output_svg_name}")
-    print(f"[DEBUG generate_summary_svg] shape_keys à dessiner: {shape_keys}")
+    logger.info(f"Génération du résumé SVG pour {output_svg_name}")
+    logger.debug(f"shape_keys à dessiner: {shape_keys}")
     if shape_history is not None:
         for k in shape_keys:
             hist = shape_history.get(k, None)
             if hist is not None:
-                print(f"  - shape_key: {k}, nb_points: {len(hist.get('simplified_points', []))}, attr: {hist.get('svg_attr', {})}")
+                logger.debug(f"  - shape_key: {k}, nb_points: {len(hist.get('simplified_points', []))}, attr: {hist.get('svg_attr', {})}")
     # Lit l'ancien SVG pour récupérer ses attributs (width, height, viewBox)
     original_tree = ET.parse(original_svg_path)
     original_root = original_tree.getroot()
@@ -818,12 +828,12 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                 })
                 group.append(path_elem)
     else:
-        print("Aucune shape_history fournie pour générer le SVG de résumé.")
+        logger.warning("Aucune shape_history fournie pour générer le SVG de résumé.")
 
     # Écriture du nouveau fichier SVG (toujours à la fin, une seule fois)
     new_tree = ET.ElementTree(new_root)
     new_tree.write(output_svg_name, encoding='utf-8', xml_declaration=True)
-    print(f"SVG généré : {output_svg_name}")
+    logger.info(f"SVG généré : {output_svg_name}")
 
 
 def flatten_cq_solids(obj):
@@ -837,15 +847,15 @@ def flatten_cq_solids(obj):
     elif hasattr(obj, 'val') and callable(obj.val):
         # Workplane avec un seul objet
         val = obj.val()
-        print(f"[flatten_cq_solids] Workplane.val() type: {type(val)}")
+        logger.debug(f"[flatten_cq_solids] Workplane.val() type: {type(val)}")
         solids.extend(flatten_cq_solids(val))
     elif hasattr(obj, 'vals') and callable(obj.vals):
         # Workplane avec plusieurs objets
         for v in obj.vals():
-            print(f"[flatten_cq_solids] Workplane.vals() type: {type(v)}")
+            logger.debug(f"[flatten_cq_solids] Workplane.vals() type: {type(v)}")
             solids.extend(flatten_cq_solids(v))
     else:
-        print(f"[flatten_cq_solids] Objet ignoré (ni CQ, ni Workplane, ni liste): {type(obj)} -> {obj}")
+        logger.debug(f"[flatten_cq_solids] Objet ignoré (ni CQ, ni Workplane, ni liste): {type(obj)} -> {obj}")
     return solids
 
 def group_wires_by_inclusion(wires, shape_history=None):
@@ -941,7 +951,7 @@ def group_wires_by_inclusion(wires, shape_history=None):
                 used_indices.update(inners_indices)
                 # Affichage des indices globaux des wires du groupe
                 global_indices = [get_global_wire_index(wires_polygons[outer_index][0], wires)] + [get_global_wire_index(wires_polygons[j][0], wires) for j in inners_indices]
-                print(f"  Group formed. Outer wire index: {outer_index} (global: {global_indices[0]}), inner wires idxs: {[j for j in inners_indices]} (globals: {global_indices[1:]})")
+                logger.debug(f"Group formed. Outer wire index: {outer_index} (global: {global_indices[0]}), inner wires idxs: {[j for j in inners_indices]} (globals: {global_indices[1:]})")
             else:
                 # Aucun wire restant ne contient d'autres, on ajoute les restants seuls
                 for idx in range(len(wires_polygons)):
@@ -949,12 +959,12 @@ def group_wires_by_inclusion(wires, shape_history=None):
                         all_groups.append((path_idx, [wires_polygons[idx][0]]))
                         used_indices.add(idx)
                         global_idx = get_global_wire_index(wires_polygons[idx][0], wires)
-                        print(f"  Group formed. Single wire: {wires_polygons[idx][0]} (no inners), global index: {global_idx}")
+                        logger.debug(f"Group formed. Single wire: {wires_polygons[idx][0]} (no inners), global index: {global_idx}")
     # Vérification que tous les path_idx ont été utilisés
     used_path_indices = {g[0] for g in all_groups}
     for path_idx in path_idx_to_wire_indices.keys():
         if path_idx not in used_path_indices:
-            print(f"[WARNING] Path index {path_idx} not used in any group, possible issue with SVG structure.")
+            logger.warning(f"Path index {path_idx} not used in any group, possible issue with SVG structure.")
     return all_groups
 
 def scale_wire_2d(wire, scale_factor):
@@ -1022,7 +1032,7 @@ def offset_polygon_along_normals(points, offset_distance, centroid_direction=1):
     # Ferme le polygone
     offset_points.append(offset_points[0])
     if not ShapelyPolygon(offset_points).is_simple:
-        print("[WARNING] Polygone offset non simple, possible auto-intersection")
+        logger.warning("Polygone offset non simple, possible auto-intersection")
     return offset_points
 
 def get_scaled_wire_from_wire(wire, offset, centroid_direction):
@@ -1060,7 +1070,7 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
     try:
         # Calcul de l'offset latéral à appliquer selon l'angle de dépouille
         offset = abs(depth) * math.tan(math.radians(draft_angle_deg))
-        print("[loft_with_draft] Début du loft individuel. Nombre de wires:", len(wire_group))
+        logger.debug(f"[loft_with_draft] Début du loft individuel. Nombre de wires: {len(wire_group)}")
         lofted_solids = []
         # Parcours de chaque wire du groupe (contour principal + trous)
         for wire_index, wire in enumerate(wire_group):
@@ -1073,7 +1083,7 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
                 face_top = cq.Face.makeFromWires(scaled_wire)
                 face_bottom = cq.Face.makeFromWires(wire)
             except Exception as e:
-                print(f"[loft_with_draft] Echec de makeFromWires (individuel) : {e}")
+                logger.debug(f"[loft_with_draft] Echec de makeFromWires (individuel) : {e}")
                 continue  # Passe au wire suivant si échec
             # Placement des faces à la bonne hauteur Z
             face_top = face_top.translate((0, 0, 0))
@@ -1082,14 +1092,14 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
             workplane = cq.Workplane("XY").add([face_top, face_bottom])
             try:
                 lofted_solid = workplane.loft(combine=True)
-                print(f"[loft_with_draft] Loft individuel réussi pour wire {wire_index}.")
+                logger.debug(f"[loft_with_draft] Loft individuel réussi pour wire {wire_index}.")
                 lofted_solids.append(lofted_solid)
             except Exception as e:
-                print(f"[loft_with_draft] Echec du loft individuel pour wire {wire_index}: {e}")
+                logger.debug(f"[loft_with_draft] Echec du loft individuel pour wire {wire_index}: {e}")
                 continue  # Passe au wire suivant si échec
         # Combine les solides : outer (index 0) en add, inners (>0) en cut
         if not lofted_solids:
-            print("[loft_with_draft] Aucun solide généré.")
+            logger.debug("[loft_with_draft] Aucun solide généré.")
             return None
         # Le premier solide (contour principal) sert de base
         result_solid = lofted_solids[0]
@@ -1098,10 +1108,10 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
             try:
                 result_solid = result_solid.cut(inner_solid)
             except Exception as e:
-                print(f"[loft_with_draft] Echec du cut pour inner : {e}")
+                logger.debug(f"[loft_with_draft] Echec du cut pour inner : {e}")
         return result_solid
     except Exception as e:
-        print(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
+        logger.debug(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
         return None
 
 def get_global_wire_index(wire, svg_wires):
@@ -1124,4 +1134,4 @@ def mark_wires_engraved(wire_group, engraved, svg_wires, shape_history, group_id
                 if isinstance(shape_key, tuple) and hist.get('cq_wire_index') == global_wire_index:
                     hist['engraved'] = engraved
         else:
-            print(f"Impossible de trouver le wire: {w} dans svg_wires pour le groupe {group_idx}.")
+            logger.warning(f"Impossible de trouver le wire: {w} dans svg_wires pour le groupe {group_idx}.")
