@@ -130,7 +130,7 @@ class TestGenerateSummarySvg(unittest.TestCase):
         """
         Vérifie la génération de SVG de résumé pour deux paths.
         """
-        svg_content = """<svg width='100' height='100' xmlns='http://www.w3.org/2000/svg'>\n    <path d='M10 10 H 90 V 30 H 10 Z' style='fill:rgb(0,255,255);stroke-width:3;stroke:rgb(0,0,0)' />\n    <path d='M20 60 Q 50 10 80 60 T 140 60' style='fill:rgb(255,128,0);stroke-width:3;stroke:rgb(0,0,0)' />\n</svg>"""
+        svg_content = """<svg width='140' height='100' xmlns='http://www.w3.org/2000/svg'>\n    <path d='M10 10 H 90 V 30 H 10 Z' style='fill:rgb(0,255,255);stroke-width:3;stroke:rgb(0,0,0)' />\n    <path d='M20 60 Q 50 10 80 60 T 140 60' style='fill:rgb(255,128,0);stroke-width:3;stroke:rgb(0,0,0)' />\n</svg>"""
         self._run_summary_svg_test(svg_content, "test_two_paths.svg", "debug_test_two_paths", "path")
 
 if __name__ == '__main__':

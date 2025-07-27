@@ -704,7 +704,7 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
 
     # --- Nouvelle logique : utiliser les points recalés et mis à l'échelle (ceux utilisés pour l'extrusion du moule) ---
     # Cela garantit que la position des polygones dans le SVG de résumé correspond à celle sur le moule.
-    if shape_history is not None and len(shape_keys) >= 2:
+    if shape_history is not None:
         # Récupère les polygones recalés et mis à l'échelle (ceux utilisés pour l'extrusion)
         polygons = []
         for (path_idx, sub_idx) in shape_keys:
