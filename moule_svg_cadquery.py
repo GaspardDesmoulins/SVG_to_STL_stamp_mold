@@ -1,5 +1,5 @@
 import cadquery as cq
-from svgpathtools import svg2paths2
+from svgpathtools import svg2paths2, parse_path, Path as Svg_Path, Line, CubicBezier, QuadraticBezier, Arc
 import numpy as np
 from pathlib import Path
 import os
@@ -34,16 +34,118 @@ def parse_transform(transform_str):
     # Si pas de matrix, retourne identité
     return np.eye(3)
 
-def get_cumulative_transform(elem):
-    """
-    Remonte l'arbre XML pour cumuler toutes les transformations des groupes parents.
-    """
-    mat = np.eye(3)
-    while elem is not None:
-        transform_str = elem.attrib.get('transform', None)
-        mat = parse_transform(transform_str) @ mat
-        elem = elem.getparent() if hasattr(elem, 'getparent') else None
-    return mat
+def apply_matrix_to_point(x, y, mat):
+    pt = np.array([x, y, 1])
+    res = mat @ pt
+    return res[0], res[1]
+
+def transform_path_d(d, mat):
+    path = parse_path(d)
+    new_path = Svg_Path()
+    for seg in path:
+        if isinstance(seg, Line):
+            start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+            end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+            new_path.append(Line(complex(*start), complex(*end)))
+        elif isinstance(seg, CubicBezier):
+            start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+            control1 = apply_matrix_to_point(seg.control1.real, seg.control1.imag, mat)
+            control2 = apply_matrix_to_point(seg.control2.real, seg.control2.imag, mat)
+            end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+            new_path.append(CubicBezier(complex(*start), complex(*control1), complex(*control2), complex(*end)))
+        elif isinstance(seg, QuadraticBezier):
+            start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+            control = apply_matrix_to_point(seg.control.real, seg.control.imag, mat)
+            end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+            new_path.append(QuadraticBezier(complex(*start), complex(*control), complex(*end)))
+        elif isinstance(seg, Arc):
+            # Pour les arcs, il faut aussi transformer les rayons et l'angle, ici on ne fait que translater les points
+            start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+            end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+            new_path.append(Line(complex(*start), complex(*end)))  # approximation
+        else:
+            new_path.append(seg)
+    return new_path.d()
+
+def flatten_svg_transforms(svg_file, debug_dir=None):
+    # Détermination du fichier SVG d'entrée à partir des règles données
+    svg_file_in = None
+    svg_file_base_name = None
+    svg_file_path = str(svg_file)
+    if svg_file_path.endswith("normalized.svg"):
+        # On prend juste le nom de base sans le suffixe _normalized
+        svg_file_base_name = os.path.splitext(os.path.basename(svg_file_path))[0].replace("_normalized", "")
+        svg_file_in = svg_file_path
+    elif debug_dir is not None and os.path.isdir(debug_dir):
+        # Cherche un fichier contenant "normalized" dans debug_dir
+        for fname in os.listdir(debug_dir):
+            if "normalized" in fname and fname.endswith(".svg"):
+                svg_file_in = os.path.join(debug_dir, fname)
+                svg_file_base_name = os.path.splitext(fname)[0].replace("_normalized", "")
+                break
+        if svg_file_in is None:
+            raise FileNotFoundError("Aucun fichier SVG 'normalized' trouvé dans le dossier debug_dir.")
+    else:
+        raise FileNotFoundError("Impossible de déterminer le fichier SVG d'entrée pour flatten_svg_transforms.")
+
+    tree = ET.parse(svg_file_in)
+    root = tree.getroot()
+
+    def recursive_apply(elem, parent_mat=np.eye(3)):
+        # Récupère la matrice de l'élément courant
+        mat = parse_transform(elem.attrib.get('transform', None)) @ parent_mat
+        # Applique la matrice aux enfants
+        for child in elem:
+            recursive_apply(child, mat)
+        # Applique la matrice aux paths
+        if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
+            elem.attrib['d'] = transform_path_d(elem.attrib['d'], mat)
+        # Supprime l'attribut transform
+        if 'transform' in elem.attrib:
+            del elem.attrib['transform']
+
+    # Applique la transformation récursive à partir de la racine
+    recursive_apply(root)
+
+
+    # Force la balise racine à être <svg> sans namespace explicite
+    root.tag = 'svg'
+    # Réordonne les attributs pour que version et xmlns soient en premier
+    ns = 'http://www.w3.org/2000/svg'
+    root.attrib['version'] = '1.0'
+    root.attrib['xmlns'] = ns
+    def order_svg_attribs(attribs):
+        ordered = [('version', attribs.get('version', '1.0')), ('xmlns', attribs.get('xmlns', ns))]
+        for k, v in attribs.items():
+            if k not in ('version', 'xmlns'):
+                ordered.append((k, v))
+        return ordered
+    attribs_dict = dict(root.attrib)
+    root.attrib.clear()
+    for k, v in order_svg_attribs(attribs_dict):
+        root.set(k, v)
+
+    # Retire le namespace des balises enfants uniquement (pas la racine)
+    for elem in root.iter():
+        if elem is not root:
+            elem.tag = strip_namespace(elem.tag)
+            elem.attrib = {strip_namespace(k): v for k, v in elem.attrib.items()}
+
+    # Détermine le nom du fichier de sortie
+    if debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        svg_file_out = os.path.join(debug_dir, f"{svg_file_base_name}_flattened.svg")
+    else:
+        svg_file_out = f"{svg_file_base_name}_flattened.svg"
+
+    # Génère le SVG sans déclaration XML ni doctype
+    normalized_svg = ET.tostring(root, encoding='unicode', method='xml')
+    normalized_svg = re.sub(r'<\?xml[^>]*>\s*', '', normalized_svg)
+    normalized_svg = re.sub(r'<!DOCTYPE[^>]*>\s*', '', normalized_svg)
+    with open(svg_file_out, 'w', encoding='utf-8') as f:
+        f.write(normalized_svg)
+
+    return svg_file_out
 
 def find_parent(root, child):
     for parent in root.iter():
@@ -142,9 +244,9 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
 
 def extract_subpaths(path, sampling):
     """
-    Découpe un objet svgpathtools.Path en sous-chemins (subpaths) selon les discontinuités.
+    Découpe un objet svgpathtools.Path (importé as Svg_Path) en sous-chemins (subpaths) selon les discontinuités.
     Args:
-        path: Objet svgpathtools.Path
+        path: Objet svgpathtools.Path (importé as Svg_Path)
         sampling: Nombre de points d'échantillonnage par segment
     Returns:
         list: Liste de sous-listes de points [x, y]
@@ -605,7 +707,8 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     os.makedirs(debug_dir, exist_ok=True)
 
     normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
-    svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
+    simplified_svg_file = flatten_svg_transforms(normalized_svg_file, debug_dir=debug_dir)
+    svg_wires, shape_history = svg_to_cadquery_wires(simplified_svg_file, max_dim)
 
     # Initialisation du statut 'engraved' pour chaque shape
     for k in shape_history:

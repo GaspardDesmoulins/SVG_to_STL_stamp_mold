@@ -1,13 +1,9 @@
 import os
 import shutil
 import unittest
-from xml.etree import ElementTree as ET
 from moule_svg_cadquery import generate_cadquery_mold , generate_summary_svg
-from utils import compare_svg_shapes_registration
-import cairosvg
+from utils import compare_svg_shapes_registration, print_svg_attrs, svg_to_array_and_save
 import numpy as np
-from PIL import Image
-from io import BytesIO
 
 
 class TestSVGTransform(unittest.TestCase):
@@ -39,42 +35,8 @@ class TestSVGTransform(unittest.TestCase):
         generate_summary_svg(self.svg_file_path, all_shape_keys, summary_svg_final, shape_history=shape_history)
         self.assertTrue(os.path.exists(summary_svg_final), "Le SVG de résumé final n'a pas été généré.")
 
-
-        # --- Vérification des attributs viewBox, width, height des deux SVG ---
-        def print_svg_attrs(svg_path, label):
-            tree = ET.parse(svg_path)
-            root = tree.getroot()
-            viewBox = root.attrib.get('viewBox', None)
-            width = root.attrib.get('width', None)
-            height = root.attrib.get('height', None)
-            print(f"[{label}] viewBox: {viewBox}, width: {width}, height: {height}")
-            return viewBox, width, height
-
         print_svg_attrs(self.svg_file_path, "SVG source")
         print_svg_attrs(summary_svg_final, "SVG résumé")
-
-        # Rasterise les deux SVGs sur une grille de pixels
-
-        def svg_to_array_and_save(svg_path, out_path, size=256):
-            """
-            Convertit un SVG en image numpy binaire (noir/blanc) et sauvegarde le PNG avec fond blanc.
-            - svg_path : chemin du SVG à rasteriser
-            - out_path : chemin du PNG à sauvegarder
-            - size : taille de la grille (pixels)
-            """
-            # Rasterise le SVG en PNG (cairosvg)
-            png_bytes = cairosvg.svg2png(url=svg_path, output_width=size, output_height=size, background_color='white')
-            # Ouvre l'image PNG en mode RGB
-            img = Image.open(BytesIO(png_bytes)).convert('RGB')
-            # Crée une image blanche de fond
-            bg = Image.new('RGB', img.size, (255, 255, 255))
-            # Superpose le rendu SVG sur le fond blanc
-            img = Image.alpha_composite(bg.convert('RGBA'), img.convert('RGBA')).convert('L')
-            img.save(out_path)
-            arr = np.array(img)
-            # Binarise (seuil à 200 pour éviter le bruit)
-            arr_bin = (arr < 200).astype(np.uint8)
-            return arr_bin
 
         src_png_path = os.path.join(self.debug_dir, "raster_source.png")
         summary_png_path = os.path.join(self.debug_dir, "raster_summary_final.png")

@@ -2,8 +2,41 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import procrustes
+import cairosvg
+from PIL import Image
+from io import BytesIO
 
+# Rasterise les deux SVGs sur une grille de pixels
+def svg_to_array_and_save(svg_path, out_path, size=256):
+    """
+    Convertit un SVG en image numpy binaire (noir/blanc) et sauvegarde le PNG avec fond blanc.
+    - svg_path : chemin du SVG à rasteriser
+    - out_path : chemin du PNG à sauvegarder
+    - size : taille de la grille (pixels)
+    """
+    # Rasterise le SVG en PNG (cairosvg)
+    png_bytes = cairosvg.svg2png(url=svg_path, output_width=size, output_height=size, background_color='white')
+    # Ouvre l'image PNG en mode RGB
+    img = Image.open(BytesIO(png_bytes)).convert('RGB')
+    # Crée une image blanche de fond
+    bg = Image.new('RGB', img.size, (255, 255, 255))
+    # Superpose le rendu SVG sur le fond blanc
+    img = Image.alpha_composite(bg.convert('RGBA'), img.convert('RGBA')).convert('L')
+    img.save(out_path)
+    arr = np.array(img)
+    # Binarise (seuil à 200 pour éviter le bruit)
+    arr_bin = (arr < 200).astype(np.uint8)
+    return arr_bin
 
+# --- Vérification des attributs viewBox, width, height des deux SVG ---
+def print_svg_attrs(svg_path, label):
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    viewBox = root.attrib.get('viewBox', None)
+    width = root.attrib.get('width', None)
+    height = root.attrib.get('height', None)
+    print(f"[{label}] viewBox: {viewBox}, width: {width}, height: {height}")
+    return viewBox, width, height
 
 def extract_svg_polygons(svg_path):
     """
