@@ -1,11 +1,11 @@
 import os
 import shutil
 import unittest
-import cadquery as cq
+from utils import find_parent
 from xml.etree import ElementTree as ET
 
 # Assurez-vous que le chemin d'accès au module est correct
-from moule_svg_cadquery import generate_cadquery_mold, find_parent
+from moule_svg_cadquery import generate_cadquery_mold
 
 class TestGenerateSummarySvg(unittest.TestCase):
     def _run_summary_svg_test(self, svg_content, svg_filename, debug_dir_name, element_tag):

@@ -9,6 +9,191 @@ from svgpathtools import parse_path, Path as Svg_Path, Line, CubicBezier, Quadra
 from PIL import Image
 from io import BytesIO
 
+def strip_namespace(tag):
+    """
+    Supprime le namespace XML d'un tag (ex : '{http://www.w3.org/2000/svg}path' -> 'path').
+    Args:
+        tag (str): Tag XML potentiellement avec namespace.
+    Returns:
+        str: Tag sans namespace.
+    """
+    return re.sub(r'\{.*\}', '', tag)
+
+def icp_affine(src_points, tgt_points, max_iter=2000, tol=1e-6):
+    """
+    Calcule la matrice affine optimale (3x3) qui transforme src_points en tgt_points (points appariés).
+    Retourne les points alignés et la matrice de transformation.
+    """
+    src = src_points.copy()
+    tgt = tgt_points.copy()
+    # Ajoute la colonne homogène
+    src_h = np.hstack([src, np.ones((src.shape[0], 1))])
+    tgt_h = np.hstack([tgt, np.ones((tgt.shape[0], 1))])
+    # Résolution par moindres carrés
+    H, _, _, _ = np.linalg.lstsq(src_h, tgt_h, rcond=None)
+    H = H.T
+    # Applique la transformation
+    src_aligned = (H @ src_h.T).T[:, :2]
+    return src_aligned, H
+
+# Applique la matrice ICP à chaque polygone du SVG normalisé et génère un nouveau SVG
+def apply_homography_to_svg_points_per_polygon(svg_in, svg_out, H_list):
+    """
+    Applique à chaque polygone du SVG la matrice affine ICP correspondante (H_list).
+    - svg_in : chemin du SVG normalisé
+    - svg_out : chemin du SVG de sortie
+    - H_list : liste de matrices (une par polygone)
+    """
+
+    def apply_matrix_to_point(x, y, mat):
+        pt = np.array([x, y, 1])
+        res = mat @ pt
+        return res[0], res[1]
+
+    def transform_path_d_per_poly(d, mat):
+        path = parse_path(d)
+        new_path = Svg_Path()
+        for seg in path:
+            if isinstance(seg, Line):
+                start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+                end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+                new_path.append(Line(complex(*start), complex(*end)))
+            elif isinstance(seg, CubicBezier):
+                start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+                control1 = apply_matrix_to_point(seg.control1.real, seg.control1.imag, mat)
+                control2 = apply_matrix_to_point(seg.control2.real, seg.control2.imag, mat)
+                end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+                new_path.append(CubicBezier(complex(*start), complex(*control1), complex(*control2), complex(*end)))
+            elif isinstance(seg, QuadraticBezier):
+                start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+                control = apply_matrix_to_point(seg.control.real, seg.control.imag, mat)
+                end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+                new_path.append(QuadraticBezier(complex(*start), complex(*control), complex(*end)))
+            elif isinstance(seg, Arc):
+                start = apply_matrix_to_point(seg.start.real, seg.start.imag, mat)
+                end = apply_matrix_to_point(seg.end.real, seg.end.imag, mat)
+                new_path.append(Line(complex(*start), complex(*end)))  # approximation
+            else:
+                new_path.append(seg)
+        return new_path.d()
+
+    tree = ET.parse(svg_in)
+    root = tree.getroot()
+
+    # Retire les balises de groupe <g> et les transformations associées
+    def flatten_tree(elem):
+        # On retire l'attribut transform
+        if 'transform' in elem.attrib:
+            del elem.attrib['transform']
+        # Si c'est un groupe <g>, on remonte ses enfants dans le parent
+        if strip_namespace(elem.tag) == 'g':
+            parent = None
+            for p in root.iter():
+                if elem in list(p):
+                    parent = p
+                    break
+            if parent is not None:
+                idx = list(parent).index(elem)
+                for child in list(elem):
+                    parent.insert(idx, child)
+                    idx += 1
+                parent.remove(elem)
+        for child in list(elem):
+            flatten_tree(child)
+
+    flatten_tree(root)
+
+    # Applique la matrice d'homographie sur chaque path (polygone)
+    path_elems = [elem for elem in root.iter() if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib]
+    if len(path_elems) != len(H_list):
+        print(f"Attention : {len(path_elems)} paths trouvés, {len(H_list)} matrices fournies.")
+    n = min(len(path_elems), len(H_list))
+    for i in range(n):
+        elem = path_elems[i]
+        mat = H_list[i]
+        elem.attrib['d'] = transform_path_d_per_poly(elem.attrib['d'], mat)
+
+    # Force la balise racine à être <svg> sans namespace explicite
+    root.tag = 'svg'
+    ns = 'http://www.w3.org/2000/svg'
+    root.attrib['version'] = '1.0'
+    root.attrib['xmlns'] = ns
+    def order_svg_attribs(attribs):
+        ordered = [('version', attribs.get('version', '1.0')), ('xmlns', attribs.get('xmlns', ns))]
+        for k, v in attribs.items():
+            if k not in ('version', 'xmlns'):
+                ordered.append((k, v))
+        return ordered
+    attribs_dict = dict(root.attrib)
+    root.attrib.clear()
+    for k, v in order_svg_attribs(attribs_dict):
+        root.set(k, v)
+
+    # Retire le namespace des balises enfants uniquement (pas la racine)
+    for elem in root.iter():
+        if elem is not root:
+            elem.tag = strip_namespace(elem.tag)
+            elem.attrib = {strip_namespace(k): v for k, v in elem.attrib.items()}
+
+    # Sauvegarde le SVG modifié sans déclaration XML ni doctype
+    normalized_svg = ET.tostring(root, encoding='unicode', method='xml')
+    normalized_svg = re.sub(r'<\?xml[^>]*>\s*', '', normalized_svg)
+    normalized_svg = re.sub(r'<!DOCTYPE[^>]*>\s*', '', normalized_svg)
+    with open(svg_out, 'w', encoding='utf-8') as f:
+        f.write(normalized_svg)
+
+# Extraction et composition des matrices de transformation du SVG
+def extract_svg_transform_matrices(svg_path):
+    """
+    Extrait toutes les matrices de transformation (transform="matrix(...)") du SVG et les compose.
+    Retourne la matrice globale 3x3.
+    """
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    matrices = []
+    for elem in root.iter():
+        t = elem.attrib.get('transform', None)
+        if t:
+            mat = parse_transform(t)
+            matrices.append(mat)
+    # Compose les matrices dans l'ordre d'apparition (première appliquée en premier)
+    if matrices:
+        mat_global = np.eye(3)
+        for m in matrices:
+            mat_global = m @ mat_global
+        return mat_global
+    else:
+        return np.eye(3)
+
+def verify_affine_vs_svg_transform_per_polygon(svg_normalized, svg_flattened):
+    """
+    Pour chaque paire de polygones (svg_normalized, svg_flattened),
+    calcule la matrice affine ICP et la compare à la matrice composée des balises transform du SVG normalisé.
+    Affiche les deux matrices.
+    """
+    polys_norm = extract_svg_polygons(svg_normalized)
+    polys_flat = extract_svg_polygons(svg_flattened)
+    if not polys_norm or not polys_flat:
+        print("Aucun polygone trouvé dans l'un des SVG.")
+        return None
+    H_svg = extract_svg_transform_matrices(svg_normalized)
+    n = min(len(polys_norm), len(polys_flat))
+    results = []
+    for i in range(n):
+        n_points = min(len(polys_norm[i]), len(polys_flat[i]))
+        def resample_poly(poly, n):
+            idxs = np.linspace(0, len(poly)-1, n).astype(int)
+            return poly[idxs]
+        poly_norm_rs = resample_poly(polys_norm[i], n_points)
+        poly_flat_rs = resample_poly(polys_flat[i], n_points)
+        _, H_icp = icp_affine(poly_norm_rs, poly_flat_rs)
+        print(f"Polygone {i} :")
+        print("  Matrice affine ICP (svg_normalized -> svg_flattened):\n", H_icp)
+        print("  Matrice composée des balises transform du SVG normalisé:\n", H_svg)
+        results.append((H_icp, H_svg))
+    return results
+
 def parse_transform(transform_str):
     """
     Parse une chaîne de transformation SVG (matrix, translate, scale, etc.) et retourne la matrice 3x3.
@@ -65,6 +250,7 @@ def transform_path_d(d, mat):
 
 def flatten_svg_transforms(svg_file, debug_dir=None):
     # Détermination du fichier SVG d'entrée à partir des règles données
+    # On cherche le fichier normalisé dans le dossier de debug, ou on prend le fichier passé en argument
     svg_file_in = None
     svg_file_base_name = None
     svg_file_path = str(svg_file)
@@ -86,23 +272,43 @@ def flatten_svg_transforms(svg_file, debug_dir=None):
 
     tree = ET.parse(svg_file_in)
     root = tree.getroot()
+    # Sauvegarde des attributs globaux du SVG source (viewBox, width, height, etc.)
+    original_attribs = dict(root.attrib)
+    original_tag = root.tag
 
-    def recursive_apply(elem, parent_mat=np.eye(3)):
-        # Récupère la matrice de l'élément courant
+    def flatten_tree(elem, parent_mat=np.eye(3)):
+        """
+        Parcours récursif de l'arbre XML SVG.
+        Pour chaque élément :
+        - Calcule la matrice de transformation cumulée (parent_mat * transform local)
+        - Applique la transformation aux enfants en premier (feuilles -> racine)
+        - Si l'élément est un <path>, applique la matrice cumulée à ses coordonnées
+        - Supprime l'attribut 'transform' après application
+        - Si l'élément est un groupe <g>, remonte ses enfants dans le parent et supprime le groupe
+        """
+        # Calcule la matrice cumulée pour cet élément
         mat = parse_transform(elem.attrib.get('transform', None)) @ parent_mat
-        # Applique la matrice aux enfants
-        for child in elem:
-            recursive_apply(child, mat)
-        # Applique la matrice aux paths
+        # On traite d'abord les enfants (feuilles les plus éloignées)
+        children = list(elem)
+        for child in children:
+            flatten_tree(child, mat)
+        # Si c'est un path, on applique la matrice cumulée
         if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
             elem.attrib['d'] = transform_path_d(elem.attrib['d'], mat)
-        # Supprime l'attribut transform
+        # On retire l'attribut transform
         if 'transform' in elem.attrib:
             del elem.attrib['transform']
+        # Si c'est un groupe <g>, on "aplatit" en remontant ses enfants dans le parent
+        if strip_namespace(elem.tag) == 'g':
+            parent = find_parent(root, elem)
+            if parent is not None:
+                idx = list(parent).index(elem)
+                for child in list(elem):
+                    parent.insert(idx, child)
+                    idx += 1
+                parent.remove(elem)
 
-    # Applique la transformation récursive à partir de la racine
-    recursive_apply(root)
-
+    flatten_tree(root)
 
     # Force la balise racine à être <svg> sans namespace explicite
     root.tag = 'svg'
@@ -154,16 +360,6 @@ def write_svg_to_file(svg, filepath):
     with open(tmp_file_path, "w") as f:
         f.write(svg)
     return tmp_file_path
-
-def strip_namespace(tag):
-    """
-    Supprime le namespace XML d'un tag (ex : '{http://www.w3.org/2000/svg}path' -> 'path').
-    Args:
-        tag (str): Tag XML potentiellement avec namespace.
-    Returns:
-        str: Tag sans namespace.
-    """
-    return re.sub(r'\{.*\}', '', tag)
 
 def propagate_attributes(elem, inherited=None):
     """
@@ -394,19 +590,26 @@ def compare_svg_shapes_registration(svg1, svg2):
         if i >= len(polys2):
             break
         poly2 = polys2[i]
-        mtx1, mtx2, disparity = procrustes_registration(poly1, poly2)
-        print(f"Polygone {i}: Disparity (erreur quadratique) = {disparity:.6f}")
-        c1 = poly1.mean(axis=0)
-        c2 = poly2.mean(axis=0)
-        # Calculer la forme alignée à partir de la matrice de transformation Procrustes
-        aligned = mtx2 * poly2.std(axis=0)
+        # Rééchantillonnage pour avoir le même nombre de points
+        n_points = min(len(poly1), len(poly2))
+        def resample_poly(poly, n):
+            idxs = np.linspace(0, len(poly)-1, n).astype(int)
+            return poly[idxs]
+        poly1_rs = resample_poly(poly1, n_points)
+        poly2_rs = resample_poly(poly2, n_points)
+        # Recalage par ICP affine
+        poly1_aligned, H = icp_affine(poly1_rs, poly2_rs)
+        # Calcul de l'erreur moyenne après recalage
+        error = np.mean(np.linalg.norm(poly1_aligned - poly2_rs, axis=1))
+        print(f"Polygone {i}: Erreur moyenne après recalage ICP = {error:.6f}")
+        print(f"Matrice de transformation affine (homographique) :\n{H}")
         try:
             plt.figure()
-            plt.plot(poly1[:,0], poly1[:,1], 'o-', label='SVG1')
-            plt.plot(poly2[:,0], poly2[:,1], 'x--', label='SVG2')
-            plt.plot(aligned[:,0], aligned[:,1], 's-', label='SVG2 aligné')
+            plt.plot(poly1_rs[:,0], poly1_rs[:,1], 'o-', label='SVG1')
+            plt.plot(poly2_rs[:,0], poly2_rs[:,1], 'x--', label='SVG2')
+            plt.plot(poly1_aligned[:,0], poly1_aligned[:,1], 's-', label='SVG1 aligné')
             plt.legend()
-            plt.title(f'Polygone {i} registration')
+            plt.title(f'Polygone {i} registration ICP')
             plt.show()
         except ImportError:
             pass

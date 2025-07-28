@@ -50,17 +50,17 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Débogueur Python : Fichier Anneau imbriqués STL",
+      "name": "Débogueur Python : Fichier Anneau imbriqués addition STL ",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/main.py",
       "args": [
         "--svg",
-        "${workspaceFolder}/svgs/Anneaux_imbriqués.svg",
+        "${workspaceFolder}/svgs/Anneaux_imbriqués_addition.svg",
         "--size",
         "40",
         "--output",
-        "${workspaceFolder}/stls/moule_anneaux_imbriqués.stl",
+        "${workspaceFolder}/stls/Anneaux_imbriqués_addition.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"

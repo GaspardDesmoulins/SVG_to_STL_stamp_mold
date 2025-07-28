@@ -2,7 +2,9 @@ import os
 import unittest
 import numpy as np
 from moule_svg_cadquery import normalize_svg_fill, flatten_svg_transforms
-from utils import svg_to_array_and_save, print_svg_attrs
+from utils import svg_to_array_and_save, print_svg_attrs, verify_affine_vs_svg_transform_per_polygon, \
+    apply_homography_to_svg_points_per_polygon
+
 
 class TestSVGFlattenSimilarity(unittest.TestCase):
     def setUp(self):
@@ -40,6 +42,14 @@ class TestSVGFlattenSimilarity(unittest.TestCase):
 
         print(f"IoU (Intersection over Union) : {iou:.3f}")
         print(f"Différence de pixels : {diff}")
+
+        # Vérification de la cohérence des transformations pour chaque polygone
+        print("\n[Analyse des matrices de transformation par polygone]")
+        results = verify_affine_vs_svg_transform_per_polygon(normalized_svg, flattened_svg)
+        H_list = [r[0] for r in results]
+        svg_icp_path = os.path.join(self.debug_dir, "svg_icp_per_polygon.svg")
+        apply_homography_to_svg_points_per_polygon(normalized_svg, svg_icp_path, H_list)
+        print(f"SVG avec points transformés par ICP sauvegardé : {svg_icp_path}")
 
         # Vérifie que la similarité est élevée (IoU > 0.95, différence faible)
         self.assertGreater(iou, 0.95, "La similarité IoU entre le SVG source et aplati est trop faible.")
