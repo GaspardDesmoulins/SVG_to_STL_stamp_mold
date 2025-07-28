@@ -35,12 +35,15 @@ class TestSVGTransform(unittest.TestCase):
         generate_summary_svg(self.svg_file_path, all_shape_keys, summary_svg_final, shape_history=shape_history)
         self.assertTrue(os.path.exists(summary_svg_final), "Le SVG de résumé final n'a pas été généré.")
 
-        print_svg_attrs(self.svg_file_path, "SVG source")
+        # Chemin du SVG aplati (après normalisation et flatten)
+        flattened_svg_path = os.path.join(self.debug_dir, f"{svg_basename}_flattened.svg")
+
+        print_svg_attrs(flattened_svg_path, "SVG aplati")
         print_svg_attrs(summary_svg_final, "SVG résumé")
 
-        src_png_path = os.path.join(self.debug_dir, "raster_source.png")
+        src_png_path = os.path.join(self.debug_dir, "raster_flattened.png")
         summary_png_path = os.path.join(self.debug_dir, "raster_summary_final.png")
-        src_arr = svg_to_array_and_save(self.svg_file_path, src_png_path, size=256)
+        src_arr = svg_to_array_and_save(flattened_svg_path, src_png_path, size=256)
         summary_arr = svg_to_array_and_save(summary_svg_final, summary_png_path, size=256)
 
         # Calcule la distance (IoU ou somme des différences)
@@ -53,8 +56,8 @@ class TestSVGTransform(unittest.TestCase):
         print(f"Différence de pixels : {diff}")
 
         # --- Comparaison des polygones SVG par registration (Procrustes) ---
-        print("\n[Analyse registration SVG] Polygones SVG source vs résumé :")
-        compare_svg_shapes_registration(self.svg_file_path, summary_svg_final)
+        print("\n[Analyse registration SVG] Polygones SVG aplati vs résumé :")
+        compare_svg_shapes_registration(flattened_svg_path, summary_svg_final)
 
 if __name__ == '__main__':
     unittest.main()
