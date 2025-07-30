@@ -40,6 +40,7 @@ conda activate moule_svg
 ## Structure du projet
 
 - `main.py` : point d'entrée principal (CLI)
+- `utils.py` : foncitons de manipulation SVG et de géométrie
 - `moule_svg_cadquery.py` : cœur du pipeline SVG → STL
 - `settings.py` : paramètres globaux (épaisseurs, marges, etc.)
 - `stls/` : STL générés
