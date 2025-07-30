@@ -36,32 +36,29 @@ class TestSVGTransform(unittest.TestCase):
         self.assertTrue(os.path.exists(summary_svg_final), "Le SVG de résumé final n'a pas été généré.")
 
         # Chemin du SVG aplati (après normalisation et flatten)
-        flattened_svg_path = os.path.join(self.debug_dir, f"{svg_basename}_flattened.svg")
+        svg_normalized = os.path.join(self.debug_dir, f"{svg_basename}_normalized.svg")
 
-        print_svg_attrs(flattened_svg_path, "SVG aplati")
+        print_svg_attrs(svg_normalized, "SVG aplati")
         print_svg_attrs(summary_svg_final, "SVG résumé")
 
-        src_png_path = os.path.join(self.debug_dir, "raster_flattened.png")
+        src_png_path = os.path.join(self.debug_dir, "raster_normalized.png")
         summary_png_path = os.path.join(self.debug_dir, "raster_summary_final.png")
-        src_arr = svg_to_array_and_save(flattened_svg_path, src_png_path, size=256)
+        src_arr = svg_to_array_and_save(svg_normalized, src_png_path, size=256)
         summary_arr = svg_to_array_and_save(summary_svg_final, summary_png_path, size=256)
 
         # Calcule la distance (IoU ou somme des différences)
         intersection = np.logical_and(src_arr, summary_arr).sum()
         union = np.logical_or(src_arr, summary_arr).sum()
         iou = intersection / union if union > 0 else 0
-        diff = np.abs(src_arr - summary_arr).sum()
 
         print(f"IoU (Intersection over Union) : {iou:.3f}")
-        print(f"Différence de pixels : {diff}")
 
         # --- Comparaison des polygones SVG par registration (Procrustes) ---
-        print("\n[Analyse registration SVG] Polygones SVG aplati vs résumé :")
-        compare_svg_shapes_registration(flattened_svg_path, summary_svg_final)
+        #print("\n[Analyse registration SVG] Polygones SVG aplati vs résumé :")
+        #compare_svg_shapes_registration(svg_normalized, summary_svg_final)
 
         # Vérifie que la similarité est élevée (IoU > 0.95, différence faible)
-        #self.assertGreater(iou, 0.95, "La similarité IoU entre le SVG source et aplati est trop faible.")
-        #self.assertLess(diff, 500, "La différence de pixels entre le SVG source et aplati est trop élevée.")
+        self.assertGreater(iou, 0.95, "La similarité IoU entre le SVG source et aplati est trop faible.")
 
 if __name__ == '__main__':
     unittest.main()

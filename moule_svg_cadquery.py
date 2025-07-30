@@ -385,7 +385,45 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
 
     logger.info(f"Normalisation du SVG : {svg_file}")
     normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
+
+    # Récupération des wires et de l'historique des shapes
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
+
+    # Calcul du rapport d'agrandissement/réduction et du min_x/min_y pour conserver l'échelle d'origine
+    # On récupère tous les points utilisés pour le SVG
+    all_points = []
+    for k in shape_history:
+        if isinstance(k, tuple):
+            pts = shape_history[k].get('simplified_points')
+            if pts:
+                all_points.extend(pts)
+    if all_points:
+        xs = [pt[0] for pt in all_points]
+        ys = [pt[1] for pt in all_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        svg_width = max_x - min_x
+        svg_height = max_y - min_y
+        if svg_width == 0 and svg_height == 0:
+            scale = 1.0
+        elif svg_width == 0:
+            scale = (max_dim - 2 * MARGE) / svg_height
+        elif svg_height == 0:
+            scale = (max_dim - 2 * MARGE) / svg_width
+        else:
+            scale = (max_dim - 2 * MARGE) / max(svg_width, svg_height)
+        # On sauvegarde dans shape_history
+        shape_history['svg_scale'] = scale
+        shape_history['svg_min_x'] = min_x
+        shape_history['svg_min_y'] = min_y
+        shape_history['svg_width'] = svg_width
+        shape_history['svg_height'] = svg_height
+    else:
+        shape_history['svg_scale'] = None
+        shape_history['svg_min_x'] = None
+        shape_history['svg_min_y'] = None
+        shape_history['svg_width'] = None
+        shape_history['svg_height'] = None
 
     # Initialisation du statut 'engraved' pour chaque shape
     for k in shape_history:
@@ -451,12 +489,27 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     group = ET.Element('g', {'id': 'summary_polygons'})
     new_root.append(group)
 
+
     # Nouvelle logique : dessiner tous les paths, même non gravés, en rouge (remplissage) si la gravure a échoué.
     if shape_history is not None:
         from collections import defaultdict
         grouped = defaultdict(list)
         for (path_idx, sub_idx) in shape_keys:
             grouped[path_idx].append((path_idx, sub_idx))
+
+        # Récupération des infos d'échelle pour remettre les polygones dans la viewBox d'origine
+        svg_scale = shape_history.get('svg_scale', None)
+        svg_min_x = shape_history.get('svg_min_x', 0)
+        svg_min_y = shape_history.get('svg_min_y', 0)
+        # Si pas d'échelle, on ne fait pas de correction
+        def to_original_coords(pt):
+            if svg_scale and svg_scale != 0:
+                x = pt[0] / svg_scale + svg_min_x
+                y = pt[1] / svg_scale + svg_min_y
+                return (x, y)
+            else:
+                return pt
+
         for path_idx, subkeys in grouped.items():
             paths_d = ''
             engraved = True  # Par défaut
@@ -473,7 +526,9 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                         # On prend le statut engraved du contour extérieur (premier subkey)
                         if (pidx, sidx) == subkeys[0]:
                             engraved = hist.get('engraved', False)
-                        paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z '
+                        # Conversion inverse de l'échelle pour chaque point
+                        pts_orig = [to_original_coords(pt) for pt in pts]
+                        paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts_orig) + ' Z '
             if paths_d:
                 if engraved:
                     style = 'fill:black;stroke:black;stroke-width:1'
