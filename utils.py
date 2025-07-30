@@ -56,6 +56,62 @@ def flatten_tree(elem, parent_mat=np.eye(3), root=None):
                 idx += 1
             parent.remove(elem)
 
+def convert_rect_ellipse_to_path(root):
+    """
+    Convertit tous les <rect> et <ellipse> du SVG en <path> équivalents (en place dans l'arbre XML).
+    """
+    import math
+    # Conversion des rectangles
+    for rect in list(root.iter()):
+        if strip_namespace(rect.tag) == 'rect':
+            x = float(rect.attrib.get('x', 0))
+            y = float(rect.attrib.get('y', 0))
+            w = float(rect.attrib.get('width', 0))
+            h = float(rect.attrib.get('height', 0))
+            rx = float(rect.attrib.get('rx', 0)) if 'rx' in rect.attrib else 0
+            ry = float(rect.attrib.get('ry', 0)) if 'ry' in rect.attrib else 0
+            # Si rx ou ry > 0, on ignore pour l'instant (arrondis non gérés)
+            if rx > 0 or ry > 0:
+                continue
+            d = f"M {x},{y} h{w} v{h} h{-w} Z"
+            path_elem = ET.Element('path', dict(rect.attrib))
+            path_elem.attrib['d'] = d
+            for k in ['x', 'y', 'width', 'height', 'rx', 'ry']:
+                if k in path_elem.attrib:
+                    del path_elem.attrib[k]
+            parent = find_parent(root, rect)
+            if parent is not None:
+                idx = list(parent).index(rect)
+                parent.insert(idx, path_elem)
+                parent.remove(rect)
+    # Conversion des ellipses
+    for ellipse in list(root.iter()):
+        if strip_namespace(ellipse.tag) == 'ellipse':
+            cx = float(ellipse.attrib.get('cx', 0))
+            cy = float(ellipse.attrib.get('cy', 0))
+            rx = float(ellipse.attrib.get('rx', 0))
+            ry = float(ellipse.attrib.get('ry', 0))
+            # Approximation par un polygone à 64 segments
+            n = 64
+            pts = [
+                (
+                    cx + rx * math.cos(2 * math.pi * i / n),
+                    cy + ry * math.sin(2 * math.pi * i / n)
+                )
+                for i in range(n)
+            ]
+            d = 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z'
+            path_elem = ET.Element('path', dict(ellipse.attrib))
+            path_elem.attrib['d'] = d
+            for k in ['cx', 'cy', 'rx', 'ry']:
+                if k in path_elem.attrib:
+                    del path_elem.attrib[k]
+            parent = find_parent(root, ellipse)
+            if parent is not None:
+                idx = list(parent).index(ellipse)
+                parent.insert(idx, path_elem)
+                parent.remove(ellipse)
+
 def align_resampled_to_reference(resampled, reference):
     """
     Décale circulairement et inverse éventuellement le sens de resampled pour minimiser la distance à reference.
@@ -492,6 +548,9 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
 
     tree = ET.parse(svg_file_path)
     root = tree.getroot()
+
+    # Conversion des rectangles et ellipses en paths avant toute opération
+    convert_rect_ellipse_to_path(root)
 
     # --- Aplatissement des transformations SVG (logique de flatten_svg_transforms) ---
     flatten_tree(root)
