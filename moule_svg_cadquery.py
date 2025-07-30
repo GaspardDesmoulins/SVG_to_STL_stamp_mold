@@ -5,14 +5,16 @@ import math
 import cadquery as cq
 import numpy as np
 from svgpathtools import svg2paths2
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from scipy.spatial import ConvexHull
-from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
 from utils import rdp, normalize_svg_fill, flatten_svg_transforms, extract_subpaths, \
-    strip_namespace, filter_points
+    strip_namespace, filter_points, resample_polygon, align_resampled_to_reference
 
 # --- Logger configuration ---
 logger = logging.getLogger("moule_svg_cadquery")
@@ -383,9 +385,7 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
 
     logger.info(f"Normalisation du SVG : {svg_file}")
     normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
-    logger.info(f"Flatten des transformations SVG : {normalized_svg_file}")
-    simplified_svg_file = flatten_svg_transforms(normalized_svg_file, debug_dir=debug_dir)
-    svg_wires, shape_history = svg_to_cadquery_wires(simplified_svg_file, max_dim)
+    svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
 
     # Initialisation du statut 'engraved' pour chaque shape
     for k in shape_history:
@@ -702,19 +702,153 @@ def offset_polygon_along_normals(points, offset_distance, centroid_direction=1):
         logger.warning("Polygone offset non simple, possible auto-intersection")
     return offset_points
 
-def get_scaled_wire_from_wire(wire, offset, centroid_direction):
+def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=True):
     """
     Génère un wire décalé (scaled) à partir d'un wire d'origine, selon la normale locale et un offset.
+    Si auto_simplify=True (par défaut), réduit automatiquement l'offset tant que le polygone n'est pas simple (pas d'auto-intersection).
     Args:
         wire (cq.Wire): Wire d'origine
         offset (float): Distance de décalage
-        direction_centroid (int): +1 pour outer, -1 pour inner
+        centroid_direction (int): +1 pour outer, -1 pour inner
+        auto_simplify (bool): Si True, réduit l'offset automatiquement si le polygone n'est pas simple
     Returns:
         cq.Wire: Wire décalé
     """
     wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
+    n_points = len(wire_points)
+    # Génération initiale des points offsetés
     offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
-    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in offset_points])
+    shapely_poly = ShapelyPolygon(offset_points)
+
+    # Si le polygone est simple ou si c'est l'outer, on retourne directement
+    if centroid_direction == 1 and shapely_poly.is_simple:
+        return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in offset_points])
+
+    # Si auto_simplify est activé, on réduit l'offset automatiquement tant que le polygone n'est pas simple
+    if auto_simplify:
+        offset_attempt = float(offset)
+        min_offset = 1e-5  # Valeur minimale d'offset pour éviter de tourner en boucle
+        max_auto_attempts = 16  # Nombre maximum de tentatives pour éviter une boucle infinie
+        attempt_counter = 0
+        while not shapely_poly.is_simple and abs(offset_attempt) > min_offset and attempt_counter < max_auto_attempts:
+            attempt_counter += 1
+            offset_attempt *= 0.5  # Réduction progressive de l'offset
+            offset_points = offset_polygon_along_normals(wire_points, offset_attempt, centroid_direction=centroid_direction)
+            shapely_poly = ShapelyPolygon(offset_points)
+        # Si on a trouvé un polygone simple, on le retourne
+        if shapely_poly.is_simple:
+            # On resample si besoin pour garder le même nombre de points
+            if len(offset_points) < len(wire_points):
+                resampled = resample_polygon(list(shapely_poly.exterior.coords), n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+            else:
+                aligned = offset_points
+            return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+        # Si aucune solution trouvée, offset zéro
+        offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
+        shapely_zero = ShapelyPolygon(offset_points_zero)
+        resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
+        aligned = align_resampled_to_reference(resampled, wire_points)
+        return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+
+    # Sinon, on propose à l'utilisateur de gérer l'auto-intersection (logique interactive)
+    max_attempts = 8
+    for attempt in range(max_attempts):
+        if shapely_poly.is_simple:
+            if len(offset_points) < len(wire_points):
+                resampled = resample_polygon(list(shapely_poly.exterior.coords), n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+            else:
+                aligned = offset_points
+                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+        # Affichage matplotlib avant/après simplification avec boutons interactifs
+        try:
+            user_choice = {'value': None}
+
+            def on_button_clicked(event, choice):
+                user_choice['value'] = choice
+                plt.close()
+
+            fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+            axs[0].set_title('Avant simplification')
+            x, y = shapely_poly.exterior.xy
+            axs[0].plot(x, y, 'r-', label='Original')
+            axs[0].fill(x, y, alpha=0.2, color='red')
+            axs[0].axis('equal')
+            # Simplification avec buffer(0)
+            simple_poly = shapely_poly.buffer(0)
+            axs[1].set_title('Après simplification (buffer(0))')
+            if isinstance(simple_poly, MultiPolygon):
+                for poly in simple_poly.geoms:
+                    x2, y2 = poly.exterior.xy
+                    axs[1].plot(x2, y2, 'g-')
+                    axs[1].fill(x2, y2, alpha=0.2, color='green')
+            elif isinstance(simple_poly, ShapelyPolygon):
+                x2, y2 = simple_poly.exterior.xy
+                axs[1].plot(x2, y2, 'g-')
+                axs[1].fill(x2, y2, alpha=0.2, color='green')
+            axs[1].axis('equal')
+            plt.suptitle(f"Wire offset inner - tentative {attempt+1}")
+
+            # Ajout des boutons sous la figure
+            button_labels = [
+                "Diminueer l'offset",
+                "Simplification OK",
+                "Offset zéro",
+                "Ignorer ce wire"
+            ]
+            actions = ['retry', 'simplify', 'zero', 'ignore']
+            button_axes = []
+            buttons = []
+            n_buttons = len(button_labels)
+            for i, label in enumerate(button_labels):
+                ax_btn = plt.axes([0.1 + 0.2*i, 0.01, 0.18, 0.06])
+                btn = Button(ax_btn, label)
+                btn.on_clicked(lambda event, c=actions[i]: on_button_clicked(event, c))
+                button_axes.append(ax_btn)
+                buttons.append(btn)
+
+            plt.show()
+
+            # Après fermeture de la fenêtre, lire le choix
+            choice = user_choice['value']
+            if choice == 'simplify':
+                # On prend le polygone simplifié (le plus grand si MultiPolygon)
+                if isinstance(simple_poly, MultiPolygon):
+                    largest = max(simple_poly.geoms, key=lambda p: p.area)
+                    simple_poly = largest
+                simple_points = list(simple_poly.exterior.coords)
+                resampled = resample_polygon(simple_points, n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+            elif choice == 'zero':
+                print("Offset mis à 0 pour ce wire sur demande utilisateur.")
+                offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
+                shapely_zero = ShapelyPolygon(offset_points_zero)
+                resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+            elif choice == 'ignore':
+                print("Wire ignoré sur demande utilisateur.")
+                return None
+            else:
+                # Retenter avec un offset plus faible
+                offset = offset * 0.5
+                offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
+                shapely_poly = ShapelyPolygon(offset_points)
+        except Exception as e:
+            print(f"Erreur lors de l'affichage ou de la simplification matplotlib : {e}")
+            # Si erreur, on retente avec offset plus faible
+            offset = offset * 0.5
+            offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
+            shapely_poly = ShapelyPolygon(offset_points)
+    # Si aucune solution trouvée, offset zéro
+    print("Offset mis à 0 pour ce wire après toutes les tentatives.")
+    offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
+    shapely_zero = ShapelyPolygon(offset_points_zero)
+    resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
+    aligned = align_resampled_to_reference(resampled, wire_points)
+    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
 
 
 def loft_with_draft(wire_group, draft_angle_deg, depth):
@@ -736,21 +870,25 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
         return None  # Pas de dépouille à appliquer
     try:
         # Calcul de l'offset latéral à appliquer selon l'angle de dépouille
-        offset = abs(depth) * math.tan(math.radians(draft_angle_deg))
+        offset_initial = abs(depth) * math.tan(math.radians(draft_angle_deg))
         logger.debug(f"[loft_with_draft] Début du loft individuel. Nombre de wires: {len(wire_group)}")
         lofted_solids = []
         # Parcours de chaque wire du groupe (contour principal + trous)
         for wire_index, wire in enumerate(wire_group):
             # Sens de l'offset : +1 pour outer, -1 pour inners
             centroid_direction = 1 if wire_index == 0 else -1
-            # Génération du wire décalé via la fonction dédiée
-            scaled_wire = get_scaled_wire_from_wire(wire, offset, centroid_direction)
+            # Outer : une seule tentative avec l'offset initial, inners : gestion interactive dans get_scaled_wire_from_wire
+            scaled_wire = get_scaled_wire_from_wire(wire, offset_initial, centroid_direction)
+            # Si l'utilisateur a choisi d'ignorer ce wire, on saute la création
+            if scaled_wire is None:
+                logger.info(f"Wire {wire_index} ignoré, aucune gravure ne sera réalisée pour ce trou.")
+                continue
             # Création des faces (top = wire décalé, bottom = wire original)
             try:
                 face_top = cq.Face.makeFromWires(scaled_wire)
                 face_bottom = cq.Face.makeFromWires(wire)
             except Exception as e:
-                logger.debug(f"[loft_with_draft] Echec de makeFromWires (individuel) : {e}")
+                logger.warning(f"[loft_with_draft] Echec de makeFromWires (individuel) : {e}")
                 continue  # Passe au wire suivant si échec
             # Placement des faces à la bonne hauteur Z
             face_top = face_top.translate((0, 0, 0))
@@ -762,11 +900,11 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
                 logger.debug(f"[loft_with_draft] Loft individuel réussi pour wire {wire_index}.")
                 lofted_solids.append(lofted_solid)
             except Exception as e:
-                logger.debug(f"[loft_with_draft] Echec du loft individuel pour wire {wire_index}: {e}")
-                continue  # Passe au wire suivant si échec
+                logger.warning(f"[loft_with_draft] Echec du loft individuel pour wire {wire_index}: {e}")
+                return None  # Passe au wire suivant si échec
         # Combine les solides : outer (index 0) en add, inners (>0) en cut
         if not lofted_solids:
-            logger.debug("[loft_with_draft] Aucun solide généré.")
+            logger.warning("[loft_with_draft] Aucun solide généré.")
             return None
         # Le premier solide (contour principal) sert de base
         result_solid = lofted_solids[0]
@@ -775,10 +913,10 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
             try:
                 result_solid = result_solid.cut(inner_solid)
             except Exception as e:
-                logger.debug(f"[loft_with_draft] Echec du cut pour inner : {e}")
+                logger.warning(f"[loft_with_draft] Echec du cut pour inner : {e}")
         return result_solid
     except Exception as e:
-        logger.debug(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
+        logger.warning(f"[loft_with_draft] Echec du loft avec dépouille (individuel) : {e}")
         return None
 
 def get_global_wire_index(wire, svg_wires):

@@ -20,6 +20,95 @@ def strip_namespace(tag):
     """
     return re.sub(r'\{.*\}', '', tag)
 
+def flatten_tree(elem, parent_mat=np.eye(3), root=None):
+    """
+    Parcours récursif de l'arbre XML SVG.
+    Pour chaque élément :
+    - Calcule la matrice de transformation cumulée (parent_mat * transform local)
+    - Applique la transformation aux enfants en premier (feuilles -> racine)
+    - Si l'élément est un <path>, applique la matrice cumulée à ses coordonnées
+    - Supprime l'attribut 'transform' après application
+    - Si l'élément est un groupe <g>, remonte ses enfants dans le parent et supprime le groupe
+    """
+    if root is None:
+        svgroot = elem
+    else:
+        svgroot = root
+    # Calcule la matrice cumulée pour cet élément
+    mat = parse_transform(elem.attrib.get('transform', None)) @ parent_mat
+    # On traite d'abord les enfants (feuilles les plus éloignées)
+    children = list(elem)
+    for child in children:
+        flatten_tree(child, mat, root=svgroot)
+    # Si c'est un path, on applique la matrice cumulée
+    if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
+        elem.attrib['d'] = transform_path_d(elem.attrib['d'], mat)
+    # On retire l'attribut transform
+    if 'transform' in elem.attrib:
+        del elem.attrib['transform']
+    # Si c'est un groupe <g>, on "aplatit" en remontant ses enfants dans le parent
+    if strip_namespace(elem.tag) == 'g':
+        parent = find_parent(root, elem)
+        if parent is not None:
+            idx = list(parent).index(elem)
+            for child in list(elem):
+                parent.insert(idx, child)
+                idx += 1
+            parent.remove(elem)
+
+def align_resampled_to_reference(resampled, reference):
+    """
+    Décale circulairement et inverse éventuellement le sens de resampled pour minimiser la distance à reference.
+    """
+    ref = np.array(reference)
+    res = np.array(resampled)
+    # Teste les deux sens
+    best = None
+    best_dist = None
+    for direction in [1, -1]:
+        if direction == -1:
+            res_dir = res[::-1]
+        else:
+            res_dir = res
+        # Cherche le meilleur décalage circulaire
+        for shift in range(len(res_dir)):
+            res_shift = np.roll(res_dir, -shift, axis=0)
+            dist = np.sum(np.linalg.norm(res_shift - ref, axis=1))
+            if best is None or dist < best_dist:
+                best = res_shift
+                best_dist = dist
+    return [tuple(pt) for pt in best]
+
+def resample_polygon(points, n):
+    """
+    Rééchantillonne une liste de points (fermée) pour obtenir n points régulièrement espacés.
+    """
+    import numpy as np
+    pts = np.array(points)
+    if not np.allclose(pts[0], pts[-1]):
+        pts = np.vstack([pts, pts[0]])
+    dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cumlen = np.concatenate([[0], np.cumsum(dists)])
+    total_length = cumlen[-1]
+    if total_length == 0 or n < 2:
+        return [tuple(pt) for pt in pts[:-1]]
+    new_locs = np.linspace(0, total_length, n+1)[:-1]
+    new_pts = []
+    for loc in new_locs:
+        idx = np.searchsorted(cumlen, loc, side='right') - 1
+        if idx >= len(pts)-1:
+            idx = len(pts)-2
+        seg_start = pts[idx]
+        seg_end = pts[idx+1]
+        seg_len = cumlen[idx+1] - cumlen[idx]
+        if seg_len == 0:
+            new_pt = seg_start
+        else:
+            t = (loc - cumlen[idx]) / seg_len
+            new_pt = seg_start + t * (seg_end - seg_start)
+        new_pts.append(tuple(new_pt))
+    return new_pts
+
 def extract_outer_inners_groups_from_svg_paths(root):
     """
     Pour chaque path du SVG, découpe en subpaths, identifie l'outer principal et les inners associés selon la règle even-odd.
@@ -150,27 +239,6 @@ def apply_homography_to_svg_points_per_polygon(svg_in, svg_out, H_list):
 
     tree = ET.parse(svg_in)
     root = tree.getroot()
-
-    # Retire les balises de groupe <g> et les transformations associées
-    def flatten_tree(elem):
-        # On retire l'attribut transform
-        if 'transform' in elem.attrib:
-            del elem.attrib['transform']
-        # Si c'est un groupe <g>, on remonte ses enfants dans le parent
-        if strip_namespace(elem.tag) == 'g':
-            parent = None
-            for p in root.iter():
-                if elem in list(p):
-                    parent = p
-                    break
-            if parent is not None:
-                idx = list(parent).index(elem)
-                for child in list(elem):
-                    parent.insert(idx, child)
-                    idx += 1
-                parent.remove(elem)
-        for child in list(elem):
-            flatten_tree(child)
 
     flatten_tree(root)
 
@@ -347,38 +415,6 @@ def flatten_svg_transforms(svg_file, debug_dir=None):
     original_attribs = dict(root.attrib)
     original_tag = root.tag
 
-    def flatten_tree(elem, parent_mat=np.eye(3)):
-        """
-        Parcours récursif de l'arbre XML SVG.
-        Pour chaque élément :
-        - Calcule la matrice de transformation cumulée (parent_mat * transform local)
-        - Applique la transformation aux enfants en premier (feuilles -> racine)
-        - Si l'élément est un <path>, applique la matrice cumulée à ses coordonnées
-        - Supprime l'attribut 'transform' après application
-        - Si l'élément est un groupe <g>, remonte ses enfants dans le parent et supprime le groupe
-        """
-        # Calcule la matrice cumulée pour cet élément
-        mat = parse_transform(elem.attrib.get('transform', None)) @ parent_mat
-        # On traite d'abord les enfants (feuilles les plus éloignées)
-        children = list(elem)
-        for child in children:
-            flatten_tree(child, mat)
-        # Si c'est un path, on applique la matrice cumulée
-        if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
-            elem.attrib['d'] = transform_path_d(elem.attrib['d'], mat)
-        # On retire l'attribut transform
-        if 'transform' in elem.attrib:
-            del elem.attrib['transform']
-        # Si c'est un groupe <g>, on "aplatit" en remontant ses enfants dans le parent
-        if strip_namespace(elem.tag) == 'g':
-            parent = find_parent(root, elem)
-            if parent is not None:
-                idx = list(parent).index(elem)
-                for child in list(elem):
-                    parent.insert(idx, child)
-                    idx += 1
-                parent.remove(elem)
-
     flatten_tree(root)
 
     # Force la balise racine à être <svg> sans namespace explicite
@@ -457,6 +493,9 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
     tree = ET.parse(svg_file_path)
     root = tree.getroot()
 
+    # --- Aplatissement des transformations SVG (logique de flatten_svg_transforms) ---
+    flatten_tree(root)
+
     ns = 'http://www.w3.org/2000/svg'
     root.tag = 'svg'
     root.attrib['version'] = '1.0'
@@ -469,7 +508,6 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
             if k not in ('version', 'xmlns'):
                 ordered.append((k, v))
         return ordered
-    # On efface et on remet les attributs dans l'ordre voulu
     attribs_dict = dict(root.attrib)
     root.attrib.clear()
     for k, v in order_svg_attribs(attribs_dict):
