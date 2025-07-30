@@ -8,6 +8,7 @@ from scipy.spatial import procrustes
 from svgpathtools import parse_path, Path as Svg_Path, Line, CubicBezier, QuadraticBezier, Arc
 from PIL import Image
 from io import BytesIO
+from shapely.geometry import Polygon
 
 def strip_namespace(tag):
     """
@@ -18,6 +19,76 @@ def strip_namespace(tag):
         str: Tag sans namespace.
     """
     return re.sub(r'\{.*\}', '', tag)
+
+def extract_outer_inners_groups_from_svg_paths(root):
+    """
+    Pour chaque path du SVG, découpe en subpaths, identifie l'outer principal et les inners associés selon la règle even-odd.
+    Retourne une liste de groupes {'outer': {...}, 'inners': [...]}, chaque groupe correspondant à un ensemble outer/inners.
+    """
+    # --- Nouvelle logique : arbre d'inclusion et regroupement par outers croissants ---
+    groups = []
+    path_elems = [elem for elem in root.iter() if elem.tag == 'path' and 'd' in elem.attrib]
+    for elem in path_elems:
+        try:
+            path = parse_path(elem.attrib['d'])
+            subpaths = extract_subpaths(path, sampling=100)
+            subpaths = [rdp(sp, epsilon=0.2) for sp in subpaths if len(sp) > 2]
+            if not subpaths:
+                continue
+            # 1. Construction de l'arbre d'inclusion
+            n = len(subpaths)
+            parents = [None] * n
+            areas = [Polygon(sp).area for sp in subpaths]
+            for i, pts_i in enumerate(subpaths):
+                poly_i = Polygon(pts_i)
+                min_area = None
+                parent_idx = None
+                for j, pts_j in enumerate(subpaths):
+                    if i == j:
+                        continue
+                    poly_j = Polygon(pts_j)
+                    # On vérifie que poly_j contient tous les points de poly_i (et pas l'inverse)
+                    # On utilise contains(poly_i) pour éviter les cycles
+                    if poly_j.contains(poly_i):
+                        area_j = poly_j.area
+                        if min_area is None or area_j < min_area:
+                            min_area = area_j
+                            parent_idx = j
+                parents[i] = parent_idx
+            # 2. Calcul du niveau d'imbrication (profondeur)
+            levels = [0] * n
+            for i in range(n):
+                idx = i
+                while parents[idx] is not None:
+                    levels[i] += 1
+                    idx = parents[idx]
+            # 3. Regroupement des outers (niveau pair) en commençant par les plus petits
+            outers = [i for i in range(n) if levels[i] % 2 == 0]
+            # Trie les outers par aire croissante
+            outers_sorted = sorted(outers, key=lambda idx: areas[idx])
+            # 4. Pour chaque outer, regroupe ses inners directs (niveau impair, parent = outer)
+            for outer_idx in outers_sorted:
+                inners_idx = [i for i in range(n) if parents[i] == outer_idx and levels[i] == levels[outer_idx] + 1]
+                group = {
+                    'outer': {'elem': elem, 'pts': subpaths[outer_idx], 'd': None},
+                    'inners': [{'pts': subpaths[i], 'd': None} for i in inners_idx]
+                }
+                # Génère le d pour chaque subpath (outer et inners)
+                def points_to_d(pts):
+                    path_obj = Svg_Path()
+                    for k in range(len(pts)):
+                        start = complex(*pts[k])
+                        end = complex(*pts[(k+1)%len(pts)])
+                        path_obj.append(Line(start, end))
+                    return path_obj.d()
+                group['outer']['d'] = points_to_d(group['outer']['pts'])
+                for idx, inner in enumerate(group['inners']):
+                    inner['d'] = points_to_d(inner['pts'])
+                groups.append(group)
+        except Exception:
+            continue
+    groups.reverse()
+    return groups
 
 def icp_affine(src_points, tgt_points, max_iter=2000, tol=1e-6):
     """
@@ -382,12 +453,12 @@ def propagate_attributes(elem, inherited=None):
                 elem.attrib[attr] = value
 
 def normalize_svg_fill(svg_file_path, debug_dir=None):
+
     tree = ET.parse(svg_file_path)
     root = tree.getroot()
 
     ns = 'http://www.w3.org/2000/svg'
-    # Forcer la balise racine <svg> à avoir version="1.0" et xmlns en premier
-    root.tag = 'svg'  # retire le namespace du tag racine
+    root.tag = 'svg'
     root.attrib['version'] = '1.0'
     root.attrib['xmlns'] = ns
 
@@ -418,8 +489,29 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
             if parent is not None:
                 parent.remove(elem)
 
+    # --- Regroupement outer/inners via fonction dédiée ---
+    all_groups = extract_outer_inners_groups_from_svg_paths(root)
+
+    # On crée un nouveau SVG avec un path par groupe (outer + inners)
+    new_root = ET.Element('svg', dict(root.attrib))
+    # Copie viewBox, width, height si présents
+    for attr in ['viewBox', 'width', 'height']:
+        if attr in root.attrib:
+            new_root.attrib[attr] = root.attrib[attr]
+
+    for group in all_groups:
+        # Crée un nouveau path pour l'outer
+        outer_elem = group['outer']['elem']
+        new_path = ET.Element('path', dict(outer_elem.attrib))
+        # Concatène le d de l'outer et des inners
+        d_concat = group['outer']['d']
+        for inner in group['inners']:
+            d_concat += ' ' + inner['d']
+        new_path.attrib['d'] = d_concat
+        new_root.append(new_path)
+
     # Générer le SVG sans déclaration XML ni doctype
-    normalized_svg = ET.tostring(root, encoding='unicode', method='xml')
+    normalized_svg = ET.tostring(new_root, encoding='unicode', method='xml')
     # Supprimer toute déclaration XML ou doctype si présente
     normalized_svg = re.sub(r'<\?xml[^>]*>\s*', '', normalized_svg)
     normalized_svg = re.sub(r'<!DOCTYPE[^>]*>\s*', '', normalized_svg)
