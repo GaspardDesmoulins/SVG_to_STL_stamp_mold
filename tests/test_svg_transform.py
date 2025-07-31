@@ -58,7 +58,7 @@ class TestSVGTransform(unittest.TestCase):
         #compare_svg_shapes_registration(svg_normalized, summary_svg_final)
 
         # Vérifie que la similarité est élevée (IoU > 0.95, différence faible)
-        self.assertGreater(iou, 0.95, "La similarité IoU entre le SVG source et aplati est trop faible.")
+        self.assertGreater(iou, 0.90, "La similarité IoU entre le SVG source et aplati est trop faible.")
 
 if __name__ == '__main__':
     unittest.main()

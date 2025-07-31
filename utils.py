@@ -73,7 +73,13 @@ def convert_rect_ellipse_to_path(root):
             # Si rx ou ry > 0, on ignore pour l'instant (arrondis non gérés)
             if rx > 0 or ry > 0:
                 continue
-            d = f"M {x},{y} h{w} v{h} h{-w} Z"
+            # Génère explicitement les 4 coins pour éviter les imprécisions, sans répéter le point de départ
+            x0, y0 = x, y
+            x1, y1 = x + w, y
+            x2, y2 = x + w, y + h
+            x3, y3 = x, y + h
+            # Ne pas répéter le point de départ avant le Z
+            d = f"M {x0},{y0} L {x1},{y1} L {x2},{y2} L {x3},{y3} Z"
             path_elem = ET.Element('path', dict(rect.attrib))
             path_elem.attrib['d'] = d
             for k in ['x', 'y', 'width', 'height', 'rx', 'ry']:
@@ -220,11 +226,18 @@ def extract_outer_inners_groups_from_svg_paths(root):
                 }
                 # Génère le d pour chaque subpath (outer et inners)
                 def points_to_d(pts):
+                    # Ne pas répéter le point de départ à la fin
+                    n = len(pts)
+                    if n < 2:
+                        return ''
                     path_obj = Svg_Path()
-                    for k in range(len(pts)):
+                    for k in range(n-1):
                         start = complex(*pts[k])
-                        end = complex(*pts[(k+1)%len(pts)])
+                        end = complex(*pts[k+1])
                         path_obj.append(Line(start, end))
+                    # Ferme le chemin si ce n'est pas déjà le cas
+                    if not (np.allclose(pts[0], pts[-1])):
+                        path_obj.append(Line(complex(*pts[-1]), complex(*pts[0])))
                     return path_obj.d()
                 group['outer']['d'] = points_to_d(group['outer']['pts'])
                 for idx, inner in enumerate(group['inners']):
