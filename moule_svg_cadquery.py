@@ -13,7 +13,7 @@ from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
-from utils import rdp, normalize_svg_fill, flatten_svg_transforms, extract_subpaths, \
+from utils import rdp, normalize_svg_fill, extract_subpaths, \
     strip_namespace, filter_points, resample_polygon, align_resampled_to_reference
 
 # --- Logger configuration ---
@@ -88,7 +88,7 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                     pt_transformed = cumulative_transform @ pt_homogeneous  # Multiplication matrice
                     transformed_points.append([pt_transformed[0], pt_transformed[1]])
                 # Simplification des points (Ramer-Douglas-Peucker)
-                simplified_points = rdp(transformed_points, epsilon=0.2)
+                simplified_points = rdp(transformed_points, epsilon=0.01)
                 # Ajout des points transformés à la liste globale
                 all_points.extend(simplified_points)
                 shapes_data.append(simplified_points)
@@ -531,9 +531,9 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                         paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts_orig) + ' Z '
             if paths_d:
                 if engraved:
-                    style = 'fill:black;stroke:black;stroke-width:1'
+                    style = 'fill:black;stroke:none'
                 else:
-                    style = 'fill:red;stroke:red;stroke-width:1'
+                    style = 'fill:red;stroke:none'
                 path_elem = ET.Element('path', {
                     'd': paths_d.strip(),
                     'style': style,
@@ -542,10 +542,10 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                 })
                 group.append(path_elem)
             else:
-                # Si aucun point utilisable, on génère un path vide en rouge (stroke)
+                # Si aucun point utilisable, on génère un path vide en marron (stroke)
                 path_elem = ET.Element('path', {
                     'd': '',
-                    'style': 'fill:none;stroke:red;stroke-width:2',
+                    'style': 'fill:brown;stroke:none',
                     'data-pathidx': str(path_idx),
                 })
                 group.append(path_elem)

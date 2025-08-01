@@ -61,62 +61,144 @@ def convert_rect_ellipse_to_path(root):
     Convertit tous les <rect> et <ellipse> du SVG en <path> équivalents (en place dans l'arbre XML).
     """
     import math
-    # Conversion des rectangles
-    for rect in list(root.iter()):
-        if strip_namespace(rect.tag) == 'rect':
+    # --- Conversion des rectangles ---
+    # On collecte tous les <rect> à convertir, puis on prépare les remplacements par parent
+    rects_to_convert = [rect for rect in root.iter() if strip_namespace(rect.tag) == 'rect']
+    parent_to_rects = {}
+    for rect in rects_to_convert:
+        parent = find_parent(root, rect)
+        if parent is not None:
+            parent_to_rects.setdefault(parent, []).append(rect)
+    # Pour chaque parent, on ajoute les nouveaux <path> à la fin, puis on supprime tous les <rect>
+    for parent, rects in parent_to_rects.items():
+        new_paths = []
+        for rect in rects:
+            # Extraction des attributs principaux
             x = float(rect.attrib.get('x', 0))
             y = float(rect.attrib.get('y', 0))
             w = float(rect.attrib.get('width', 0))
             h = float(rect.attrib.get('height', 0))
             rx = float(rect.attrib.get('rx', 0)) if 'rx' in rect.attrib else 0
             ry = float(rect.attrib.get('ry', 0)) if 'ry' in rect.attrib else 0
+            stroke = rect.attrib.get('stroke', None)
+            # stroke-width : si défini, on prend la valeur, sinon 1 si stroke présent, sinon 0
+            if stroke is not None:
+                if 'stroke-width' in rect.attrib:
+                    stroke_width = float(rect.attrib['stroke-width'])
+                else:
+                    stroke_width = 1.0
+            else:
+                stroke_width = 0
             # Si rx ou ry > 0, on ignore pour l'instant (arrondis non gérés)
             if rx > 0 or ry > 0:
                 continue
-            # Génère explicitement les 4 coins pour éviter les imprécisions, sans répéter le point de départ
-            x0, y0 = x, y
-            x1, y1 = x + w, y
-            x2, y2 = x + w, y + h
-            x3, y3 = x, y + h
-            # Ne pas répéter le point de départ avant le Z
-            d = f"M {x0},{y0} L {x1},{y1} L {x2},{y2} L {x3},{y3} Z"
+            # Si stroke et stroke-width > 0, on élargit simplement le rectangle vers l'extérieur de sw/2
+            if stroke and stroke_width > 0:
+                sw = stroke_width
+                x0, y0 = x - sw/2, y - sw/2
+                x1, y1 = x + w + sw/2, y - sw/2
+                x2, y2 = x + w + sw/2, y + h + sw/2
+                x3, y3 = x - sw/2, y + h + sw/2
+                d = f"M {x0},{y0} L {x1},{y1} L {x2},{y2} L {x3},{y3} Z"
+            else:
+                # Génère explicitement les 4 coins pour éviter les imprécisions, sans répéter le point de départ
+                x0, y0 = x, y
+                x1, y1 = x + w, y
+                x2, y2 = x + w, y + h
+                x3, y3 = x, y + h
+                d = f"M {x0},{y0} L {x1},{y1} L {x2},{y2} L {x3},{y3} Z"
+            # Création du nouvel élément <path> avec les mêmes attributs (copie)
             path_elem = ET.Element('path', dict(rect.attrib))
             path_elem.attrib['d'] = d
-            for k in ['x', 'y', 'width', 'height', 'rx', 'ry']:
+            # Supprime les attributs spécifiques au rect
+            for k in ['x', 'y', 'width', 'height', 'rx', 'ry', 'stroke', 'stroke-width']:
                 if k in path_elem.attrib:
                     del path_elem.attrib[k]
-            parent = find_parent(root, rect)
-            if parent is not None:
-                idx = list(parent).index(rect)
-                parent.insert(idx, path_elem)
-                parent.remove(rect)
-    # Conversion des ellipses
-    for ellipse in list(root.iter()):
-        if strip_namespace(ellipse.tag) == 'ellipse':
+            # Ajoute un attribut fill explicite (par défaut noir)
+            path_elem.attrib['fill'] = path_elem.attrib.get('fill', '#000')
+            new_paths.append(path_elem)
+        # Ajoute tous les nouveaux paths à la fin du parent
+        for path_elem in new_paths:
+            parent.append(path_elem)
+        # Supprime tous les <rect> du parent
+        for rect in rects:
+            parent.remove(rect)
+
+    # --- Conversion des ellipses ---
+    # On collecte tous les <ellipse> à convertir, puis on prépare les remplacements par parent
+    ellipses_to_convert = [ellipse for ellipse in root.iter() if strip_namespace(ellipse.tag) == 'ellipse']
+    parent_to_ellipses = {}
+    for ellipse in ellipses_to_convert:
+        parent = find_parent(root, ellipse)
+        if parent is not None:
+            parent_to_ellipses.setdefault(parent, []).append(ellipse)
+    # Pour chaque parent, on ajoute les nouveaux <path> à la fin, puis on supprime tous les <ellipse>
+    for parent, ellipses in parent_to_ellipses.items():
+        new_paths = []
+        for ellipse in ellipses:
+            # Extraction des attributs principaux
             cx = float(ellipse.attrib.get('cx', 0))
             cy = float(ellipse.attrib.get('cy', 0))
             rx = float(ellipse.attrib.get('rx', 0))
             ry = float(ellipse.attrib.get('ry', 0))
-            # Approximation par un polygone à 64 segments
-            n = 64
-            pts = [
-                (
-                    cx + rx * math.cos(2 * math.pi * i / n),
-                    cy + ry * math.sin(2 * math.pi * i / n)
-                )
-                for i in range(n)
-            ]
-            d = 'M ' + ' '.join(f'{x},{y}' for x, y in pts) + ' Z'
+            stroke = ellipse.attrib.get('stroke', None)
+            # stroke-width : si défini, on prend la valeur, sinon 1 si stroke présent, sinon 0
+            if stroke is not None:
+                if 'stroke-width' in ellipse.attrib:
+                    stroke_width = float(ellipse.attrib['stroke-width'])
+                else:
+                    stroke_width = 1.0
+            else:
+                stroke_width = 0
+            # Si stroke, on élargit l'ellipse
+            if stroke and stroke_width > 0:
+                rx2 = rx + stroke_width/2
+                ry2 = ry + stroke_width/2
+            else:
+                rx2 = rx
+                ry2 = ry
+            # Approximation de l'ellipse par 4 courbes de Bézier cubiques (méthode de Spiro/Adobe)
+            # Constante magique pour l'approximation (voir https://spencermortensen.com/articles/bezier-circle/)
+            kappa = 0.5522847498307936
+            dx = rx2 * kappa
+            dy = ry2 * kappa
+            # Points de contrôle
+            p0 = (cx + rx2, cy)
+            c1 = (cx + rx2, cy + dy)
+            c2 = (cx + dx, cy + ry2)
+            p1 = (cx, cy + ry2)
+            c3 = (cx - dx, cy + ry2)
+            c4 = (cx - rx2, cy + dy)
+            p2 = (cx - rx2, cy)
+            c5 = (cx - rx2, cy - dy)
+            c6 = (cx - dx, cy - ry2)
+            p3 = (cx, cy - ry2)
+            c7 = (cx + dx, cy - ry2)
+            c8 = (cx + rx2, cy - dy)
+            # Construction du path d
+            d = (
+                f"M {p0[0]},{p0[1]} "
+                f"C {c1[0]},{c1[1]} {c2[0]},{c2[1]} {p1[0]},{p1[1]} "
+                f"C {c3[0]},{c3[1]} {c4[0]},{c4[1]} {p2[0]},{p2[1]} "
+                f"C {c5[0]},{c5[1]} {c6[0]},{c6[1]} {p3[0]},{p3[1]} "
+                f"C {c7[0]},{c7[1]} {c8[0]},{c8[1]} {p0[0]},{p0[1]} Z"
+            )
+            # Création du nouvel élément <path> avec les mêmes attributs (copie)
             path_elem = ET.Element('path', dict(ellipse.attrib))
             path_elem.attrib['d'] = d
-            for k in ['cx', 'cy', 'rx', 'ry']:
+            # Supprime les attributs spécifiques à ellipse
+            for k in ['cx', 'cy', 'rx', 'ry', 'stroke', 'stroke-width']:
                 if k in path_elem.attrib:
                     del path_elem.attrib[k]
-            parent = find_parent(root, ellipse)
-            if parent is not None:
-                idx = list(parent).index(ellipse)
-                parent.insert(idx, path_elem)
-                parent.remove(ellipse)
+            # Ajoute un attribut fill explicite (par défaut noir)
+            path_elem.attrib['fill'] = path_elem.attrib.get('fill', '#000')
+            new_paths.append(path_elem)
+        # Ajoute tous les nouveaux paths à la fin du parent
+        for path_elem in new_paths:
+            parent.append(path_elem)
+        # Supprime tous les <ellipse> du parent
+        for ellipse in ellipses:
+            parent.remove(ellipse)
 
 def align_resampled_to_reference(resampled, reference):
     """
@@ -182,8 +264,10 @@ def extract_outer_inners_groups_from_svg_paths(root):
     for elem in path_elems:
         try:
             path = parse_path(elem.attrib['d'])
-            subpaths = extract_subpaths(path, sampling=100)
-            subpaths = [rdp(sp, epsilon=0.2) for sp in subpaths if len(sp) > 2]
+            subpaths = extract_subpaths(path, nb_pts_smpl=128)
+            # pas de simplification RDP pour préserver la douceur des courbes (notamment les ellipses)
+            subpaths = [sp for sp in subpaths if len(sp) > 2]
+            
             if not subpaths:
                 continue
             # 1. Construction de l'arbre d'inclusion
@@ -636,12 +720,42 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
         normd_file_path = write_svg_to_file(normalized_svg, svg_file_path)
     return normd_file_path
 
-def extract_subpaths(path, sampling):
+# Sur-échantillonnage adaptatif pour préserver la douceur des courbes de Bézier
+def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=0.1):
+    # Pour les segments de Bézier, adapte le nombre de points à la courbure
+    if isinstance(segment, (CubicBezier, QuadraticBezier)):
+        # On estime la longueur de la courbe et la courbure max
+        length = segment.length(error=1e-4)
+        # On approxime la courbure max par la distance max entre la courbe et la corde
+        ts = np.linspace(0, 1, 10)
+        pts = np.array([[pt.real, pt.imag] for pt in [segment.point(t) for t in ts]])
+        A = np.array([segment.point(0).real, segment.point(0).imag])
+        B = np.array([segment.point(1).real, segment.point(1).imag])
+        AB = B - A
+        AP = pts - A
+        norm_AB = np.linalg.norm(AB)
+        if norm_AB < 1e-12:
+            dists = np.linalg.norm(AP, axis=1)
+        else:
+            # Produit vectoriel 2D (résultat scalaire)
+            cross = AB[0]*AP[:,1] - AB[1]*AP[:,0]
+            dists = np.abs(cross) / norm_AB
+        max_curv = np.max(dists)
+        # Plus la courbure est forte, plus on met de points
+        n = int(min(max_pts, max(min_pts, length * (1 + 10*max_curv) / tol)))
+        ts = np.linspace(0, 1, n)
+        return [segment.point(t) for t in ts]
+    else:
+        # Pour les segments linéaires ou arcs, sampling fixe
+        return [segment.point(t) for t in np.linspace(0, 1, nb_pts_smpl)]
+
+
+def extract_subpaths(path, nb_pts_smpl):
     """
     Découpe un objet svgpathtools.Path (importé as Svg_Path) en sous-chemins (subpaths) selon les discontinuités.
     Args:
         path: Objet svgpathtools.Path (importé as Svg_Path)
-        sampling: Nombre de points d'échantillonnage par segment
+        nb_pts_smpl: Nombre de points d'échantillonnage par segment
     Returns:
         list: Liste de sous-listes de points [x, y]
     """
@@ -653,7 +767,7 @@ def extract_subpaths(path, sampling):
             if current_subpath:
                 subpaths.append(current_subpath)
             current_subpath = []
-        pts = [segment.point(t) for t in np.linspace(0, 1, sampling)]
+        pts = adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=2000, tol=0.1)
         for pt in pts:
             current_subpath.append([pt.real, pt.imag])
         prev_end = segment.end
