@@ -4,6 +4,8 @@ import logging
 import math
 import cadquery as cq
 import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
 from svgpathtools import svg2paths2
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
@@ -13,8 +15,9 @@ from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
-from utils import rdp, normalize_svg_fill, extract_subpaths, \
-    strip_namespace, filter_points, resample_polygon, align_resampled_to_reference
+from utils import normalize_svg_fill, extract_subpaths, to_original_coords, \
+    is_visible, filter_points, resample_polygon, align_resampled_to_reference, \
+    offset_polygon_along_normals
 
 # --- Logger configuration ---
 logger = logging.getLogger("moule_svg_cadquery")
@@ -25,7 +28,7 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=True, force_all_contours=False):
+def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, rdp=False, force_all_contours=False):
     """
     Convertit un SVG en wires CadQuery, avec simplification et gestion de l'échelle.
     Peut forcer l'extraction de tous les contours (utile pour les SVG Affinity Designer).
@@ -42,53 +45,30 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
     shape_keys = []
     wire_to_shape = {}
 
-    # --- Extraction simple des éléments <path> (le SVG est déjà aplati, donc pas de transformation à appliquer) ---
-    tree = ET.parse(str(svgfile.absolute()))
-    root = tree.getroot()
-    svg_path_elements = [el for el in root.iter() if strip_namespace(el.tag) == 'path']
-    # On associe chaque élément <path> à la matrice identité (aucune transformation restante)
-    path_with_transform = [(path_elem, np.eye(3)) for path_elem in svg_path_elements]
-    # --- Fin extraction simplifiée ---
-
-    def is_visible(attr):
-        if force_all_contours:
-            return True
-        fill = attr.get('fill', None)
-        stroke = attr.get('stroke', None)
-        def is_none_or_transparent(val):
-            if val is None:
-                return False
-            val = val.strip().lower()
-            return val in ['none', 'transparent']
-        return not (is_none_or_transparent(fill) and is_none_or_transparent(stroke))
-
     # --- Étape 2 : Application des transformations à chaque path SVG ---
     # On parcourt les paths extraits par svg2paths2, mais on applique la matrice trouvée à chaque point du path.
     # On suppose que l'ordre des paths svgpathtools et des éléments XML <path> est identique (plus robuste que la comparaison d'attributs).
     for path_idx, (svgpathtools_path, svgpathtools_attr) in enumerate(zip(paths, attributes)):
-        if not is_visible(svgpathtools_attr):
+        if not is_visible(svgpathtools_attr, force_all_contours):
             continue
-        logger.debug(f"--- Path {path_idx} ---")
-        # Récupère la matrice de transformation cumulée pour ce path
-        if path_idx < len(path_with_transform):
-            cumulative_transform = path_with_transform[path_idx][1]
-        else:
-            cumulative_transform = np.eye(3)
+        logger.info(f"--- Path {path_idx} ---")
         # Extraction des sous-chemins (subpaths) du path SVG
         subpaths = extract_subpaths(svgpathtools_path, sampling_default)
-        logger.debug(f"Subpaths {len(subpaths)}")
-        for sub_idx, sampled_points in enumerate(subpaths):
+        logger.info(f"Subpaths {len(subpaths)}")
+        for sub_idx, sampled_points in tqdm(enumerate(subpaths)):
             if sampled_points:
-                # --- Application de la matrice de transformation à chaque point du path ---
-                # On transforme chaque point [x, y] en [x', y'] via la matrice SVG cumulée
-                transformed_points = []
-                for pt in sampled_points:
-                    # On homogénéise le point pour la matrice 3x3
-                    pt_homogeneous = np.array([pt[0], pt[1], 1])
-                    pt_transformed = cumulative_transform @ pt_homogeneous  # Multiplication matrice
-                    transformed_points.append([pt_transformed[0], pt_transformed[1]])
-                # Simplification des points (Ramer-Douglas-Peucker)
-                simplified_points = rdp(transformed_points, epsilon=0.01)
+                if rdp:
+                    # Calcul adaptatif de l'epsilon
+                    xs = [pt[0] for pt in sampled_points]
+                    ys = [pt[1] for pt in sampled_points]
+                    max_dim = max(max(xs) - min(xs), max(ys) - min(ys))
+                    epsilon = max_dim / 15000 if max_dim > 0 else 0.2  # Valeur par défaut si max_dim=0
+
+                    # Simplification des points (Ramer-Douglas-Peucker)
+                    simplified_points = rdp(sampled_points, epsilon=epsilon)
+                else:
+                    # Pas de simplification, on utilise les points tels quels
+                    simplified_points = sampled_points
                 # Ajout des points transformés à la liste globale
                 all_points.extend(simplified_points)
                 shapes_data.append(simplified_points)
@@ -98,16 +78,11 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, interactive=Tru
                     'svg_path_idx': path_idx,
                     'svg_sub_idx': sub_idx,
                     'svg_attr': dict(svgpathtools_attr),
-                    'sampled_points': transformed_points,
+                    'sampled_points': sampled_points,
                     'simplified_points': simplified_points,
                     'cq_wire_index': None,
                 }
-                logger.debug(f"Path {path_idx}, subpath {sub_idx}, nb_points: {len(simplified_points)}, type: path, attr: {svgpathtools_attr}")
-
-    logger.debug(f"shape_history keys: {list(shape_history.keys())}")
-    for k, v in shape_history.items():
-        if isinstance(k, tuple):
-            logger.debug(f"shape_history[{k}]: nb_points={len(v.get('simplified_points', []))}, type={k[0]}")
+                logger.info(f"Path {path_idx}, subpath {sub_idx}, nb points init : {len(sampled_points)}, nb simplified points: {len(simplified_points)}")
 
     if not all_points:
         logger.error("Aucun chemin SVG trouvé avec fill ou stroke pour créer le moule.")
@@ -300,7 +275,7 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     for group_idx, wire_group in grouped_wires:
         try:
             logger.info(f"--- Gravure polygone {group_idx} (groupe de {len(wire_group)} wires) ---")
-            for wire_index, wire in enumerate(wire_group):
+            for wire_index, wire in tqdm(enumerate(wire_group)):
                 try:
                     global_wire_index = svg_wires.index(wire)
                 except ValueError:
@@ -489,10 +464,8 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     group = ET.Element('g', {'id': 'summary_polygons'})
     new_root.append(group)
 
-
     # Nouvelle logique : dessiner tous les paths, même non gravés, en rouge (remplissage) si la gravure a échoué.
     if shape_history is not None:
-        from collections import defaultdict
         grouped = defaultdict(list)
         for (path_idx, sub_idx) in shape_keys:
             grouped[path_idx].append((path_idx, sub_idx))
@@ -500,15 +473,7 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
         # Récupération des infos d'échelle pour remettre les polygones dans la viewBox d'origine
         svg_scale = shape_history.get('svg_scale', None)
         svg_min_x = shape_history.get('svg_min_x', 0)
-        svg_min_y = shape_history.get('svg_min_y', 0)
-        # Si pas d'échelle, on ne fait pas de correction
-        def to_original_coords(pt):
-            if svg_scale and svg_scale != 0:
-                x = pt[0] / svg_scale + svg_min_x
-                y = pt[1] / svg_scale + svg_min_y
-                return (x, y)
-            else:
-                return pt
+        svg_min_y = shape_history.get('svg_min_y', 0)        
 
         for path_idx, subkeys in grouped.items():
             paths_d = ''
@@ -527,7 +492,11 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                         if (pidx, sidx) == subkeys[0]:
                             engraved = hist.get('engraved', False)
                         # Conversion inverse de l'échelle pour chaque point
-                        pts_orig = [to_original_coords(pt) for pt in pts]
+                        if(svg_scale is not None and svg_min_x is not None and svg_min_y is not None):
+                               pts_orig = [to_original_coords(pt, svg_scale, svg_min_x, svg_min_y) for pt in pts]
+                        else:
+                            logger.warning("Aucune échelle SVG trouvée, les points ne seront pas remis dans la viewBox d'origine.")
+                            pts_orig = pts
                         paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts_orig) + ' Z '
             if paths_d:
                 if engraved:
@@ -696,68 +665,7 @@ def scale_wire_2d(wire, scale_factor):
     scaled_pts = centroid + (pts - centroid) * scale_factor
     return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in scaled_pts])
 
-def offset_polygon_along_normals(points, offset_distance, centroid_direction=1):
-    """
-    Décale chaque point d'un polygone selon la normale locale à la bordure.
-    - points : liste de tuples (x, y) du polygone (doit être fermé ou sera fermé automatiquement)
-    - offset_distance : distance de décalage (positive)
-    - centroid_direction : +1 pour outer (vers l'extérieur du centroïde), -1 pour inner (vers le centroïde)
-    Retourne une nouvelle liste de points décalés.
-    """
-    # Filtre les points dupliqués consécutifs
-    filtered_points = [points[0]]
-    for pt in points[1:]:
-        if np.linalg.norm(np.array(pt) - np.array(filtered_points[-1])) > 1e-10:
-            filtered_points.append(pt)
-    points = filtered_points
-    pts = np.array(points)
-    num_points = len(pts)
-    # S'assurer que le polygone est fermé (premier et dernier point identiques)
-    if not np.allclose(pts[0], pts[-1]):
-        closed_pts = np.vstack([pts, pts[0]])
-    else:
-        closed_pts = pts
-    centroid = pts.mean(axis=0)
-    offset_points = []
-    for i in range(num_points):
-        prev_point = closed_pts[(i - 1) % num_points]
-        current_point = closed_pts[i]
-        next_point = closed_pts[(i + 1) % num_points]
-        # Vecteurs des segments adjacents
-        vec_prev = current_point - prev_point
-        vec_next = next_point - current_point
-        # Normales aux segments (sens trigo)
-        normal_prev = np.array([-vec_prev[1], vec_prev[0]])
-        normal_next = np.array([-vec_next[1], vec_next[0]])
-        norm_prev = np.linalg.norm(normal_prev)
-        norm_next = np.linalg.norm(normal_next)
-        if norm_prev < 1e-10 or norm_next < 1e-10:
-            # Si un segment est nul, saute la normale correspondante
-            normal = normal_prev if norm_next < 1e-10 else normal_next
-            if np.linalg.norm(normal) < 1e-10:
-                normal = np.array([1.0, 0.0])  # Valeur par défaut
-        else:
-            normal_prev /= norm_prev
-            normal_next /= norm_next
-            # Normale moyenne au sommet
-            normal = (normal_prev + normal_next)
-            if np.linalg.norm(normal) < 1e-8:
-                normal = normal_prev  # Cas angle plat
-            else:
-                normal /= np.linalg.norm(normal)
-        # Sens de la normale (vers l'extérieur ou l'intérieur)
-        to_centroid = centroid - current_point
-        if np.dot(normal, to_centroid) * centroid_direction > 0:
-            normal = -normal
-        offset_point = current_point + offset_distance * normal
-        offset_points.append(tuple(offset_point))
-    # Ferme le polygone
-    offset_points.append(offset_points[0])
-    if not ShapelyPolygon(offset_points).is_simple:
-        logger.warning("Polygone offset non simple, possible auto-intersection")
-    return offset_points
-
-def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=True):
+def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=False):
     """
     Génère un wire décalé (scaled) à partir d'un wire d'origine, selon la normale locale et un offset.
     Si auto_simplify=True (par défaut), réduit automatiquement l'offset tant que le polygone n'est pas simple (pas d'auto-intersection).
@@ -783,7 +691,7 @@ def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=Tr
     if auto_simplify:
         offset_attempt = float(offset)
         min_offset = 1e-5  # Valeur minimale d'offset pour éviter de tourner en boucle
-        max_auto_attempts = 16  # Nombre maximum de tentatives pour éviter une boucle infinie
+        max_auto_attempts = 16  # Nombre maximum de tentatives pour éviter une boucle
         attempt_counter = 0
         while not shapely_poly.is_simple and abs(offset_attempt) > min_offset and attempt_counter < max_auto_attempts:
             attempt_counter += 1
@@ -928,6 +836,37 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
         offset_initial = abs(depth) * math.tan(math.radians(draft_angle_deg))
         logger.debug(f"[loft_with_draft] Début du loft individuel. Nombre de wires: {len(wire_group)}")
         lofted_solids = []
+        # --- Affichage interactif matplotlib des polygones ---
+        fig, ax = plt.subplots()
+        # Affichage du wire non modifié (contour principal en noir, inners en noir aussi)
+        for wire_index, wire in enumerate(wire_group):
+            wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
+            xs, ys = zip(*wire_points)
+            if wire_index == 0:
+                ax.plot(xs, ys, color='black', linewidth=2, label='Wire original (outer)')
+            else:
+                ax.plot(xs, ys, color='black', linestyle='--', linewidth=1, label='Wire original (inner)' if wire_index == 1 else None)
+        # Affichage du wire outer décalé en bleu
+        outer_scaled_wire = get_scaled_wire_from_wire(wire_group[0], offset_initial, 1)
+        if outer_scaled_wire is not None:
+            outer_scaled_points = [(v.X, v.Y) for v in outer_scaled_wire.Vertices()]
+            xs, ys = zip(*outer_scaled_points)
+            ax.plot(xs, ys, color='blue', linewidth=2, label='Wire outer décalé')
+        # Affichage des wires inners décalés en marron
+        for wire_index, wire in enumerate(wire_group[1:], start=1):
+            inner_scaled_wire = get_scaled_wire_from_wire(wire, offset_initial, -1)
+            if inner_scaled_wire is not None:
+                inner_scaled_points = [(v.X, v.Y) for v in inner_scaled_wire.Vertices()]
+                xs, ys = zip(*inner_scaled_points)
+                ax.plot(xs, ys, color='brown', linewidth=2, label='Wire inner décalé' if wire_index == 1 else None)
+        ax.set_aspect('equal')
+        ax.set_title("Polygones pour le loft avec dépouille")
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        plt.show()
+        # --- Fin affichage interactif ---
+
         # Parcours de chaque wire du groupe (contour principal + trous)
         for wire_index, wire in enumerate(wire_group):
             # Sens de l'offset : +1 pour outer, -1 pour inners

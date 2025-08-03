@@ -1,10 +1,12 @@
 import re
 import os
+import logging
 import cairosvg
 import xml.etree.ElementTree as ET
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import procrustes
+from shapely.geometry import Polygon as ShapelyPolygon
 from svgpathtools import parse_path, Path as Svg_Path, Line, CubicBezier, QuadraticBezier, Arc
 from PIL import Image
 from io import BytesIO
@@ -200,6 +202,106 @@ def convert_rect_ellipse_to_path(root):
         for ellipse in ellipses:
             parent.remove(ellipse)
 
+# --- Calcul de l'aire signée pour orientation du polygone ---
+def polygon_signed_area(points):
+    """
+    Calcule l'aire signée d'un polygone (x, y).
+    Aire > 0 : polygone orienté anti-horaire (extérieur à gauche)
+    Aire < 0 : polygone horaire (extérieur à droite)
+    """
+    area = 0.0
+    n = len(points)
+    for i in range(n):
+        x0, y0 = points[i]
+        x1, y1 = points[(i + 1) % n]
+        area += (x0 * y1) - (x1 * y0)
+    return area / 2.0
+
+def offset_polygon_along_normals(points, offset_distance, centroid_direction, logger=None):
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    # Filtre les points dupliqués consécutifs pour éviter les artefacts
+    filtered_points = [points[0]]
+    for pt in points[1:]:
+        if np.linalg.norm(np.array(pt) - np.array(filtered_points[-1])) > 1e-10:
+            filtered_points.append(pt)
+    points = filtered_points
+    pts = np.array(points)
+    num_points = len(pts)
+    # S'assurer que le polygone est fermé (premier et dernier point identiques)
+    if not np.allclose(pts[0], pts[-1]):
+        closed_pts = np.vstack([pts, pts[0]])
+    else:
+        closed_pts = pts
+    # Détermination de l'orientation du polygone (aire signée)
+    area = polygon_signed_area(points)
+    is_ccw = area > 0  # True si anti-horaire
+
+    # Correction d'orientation : outer doit être CCW, inner doit être CW
+    # On inverse les points si besoin pour garantir l'orientation attendue
+    if is_ccw:
+        closed_pts = np.flipud(closed_pts)
+
+    # Vérification initiale : si le polygone d'origine n'est pas simple, on ne tente pas d'offset
+    if not ShapelyPolygon(points).is_simple:
+        logger.warning("Polygone d'origine non simple, offset ignoré.")
+        return list(points) + [points[0]]
+
+    min_offset = 1e-6
+    max_iter = 16
+    offset_points = [None] * num_points
+    for i in range(num_points):
+        prev_point = closed_pts[(i - 1) % num_points]
+        current_point = closed_pts[i]
+        next_point = closed_pts[(i + 1) % num_points]
+        # Calcul des vecteurs des segments adjacents
+        vec_prev = current_point - prev_point
+        vec_next = next_point - current_point
+        # Calcul des normales locales aux segments
+        normal_prev = np.array([-vec_prev[1], vec_prev[0]])
+        normal_next = np.array([-vec_next[1], vec_next[0]])
+        norm_prev = np.linalg.norm(normal_prev)
+        norm_next = np.linalg.norm(normal_next)
+        if norm_prev < 1e-10 or norm_next < 1e-10:
+            # Cas dégénéré : un des segments est trop court
+            normal = normal_prev if norm_next < 1e-10 else normal_next
+            if np.linalg.norm(normal) < 1e-10:
+                normal = np.array([1.0, 0.0])
+        else:
+            # Moyenne des normales pour lisser la direction locale
+            normal_prev /= norm_prev
+            normal_next /= norm_next
+            normal = (normal_prev + normal_next)
+            if np.linalg.norm(normal) < 1e-8:
+                normal = normal_prev
+            else:
+                normal /= np.linalg.norm(normal)
+        offset_local = float(offset_distance)
+        for attempt in range(max_iter):
+            # Offset toujours dans le sens centroid_direction
+            # Cela garantit que l'outer est toujours vers l'extérieur et l'inner vers l'intérieur,
+            # indépendamment de l'orientation initiale du polygone.
+            final_offset = offset_local * centroid_direction
+            candidate_point = tuple(current_point + final_offset * normal)
+            # On teste le polygone avec ce point déplacé
+            test_points = [offset_points[j] if (offset_points[j] is not None) else tuple(closed_pts[j]) for j in range(num_points)]
+            test_points[i] = candidate_point
+            test_points_closed = test_points + [test_points[0]]
+            poly = ShapelyPolygon(test_points_closed)
+            if poly.is_simple:
+                offset_points[i] = candidate_point
+                break
+            else:
+                # Si auto-intersection, on réduit l'offset localement
+                offset_local *= 0.5
+                if abs(offset_local) < min_offset:
+                    logger.warning(f"Offset trop faible pour le point {i}, auto-intersection persistante.")
+                    offset_points[i] = tuple(current_point)
+                    break
+    # On ferme le polygone
+    offset_points.append(offset_points[0])
+    return offset_points
+
 def align_resampled_to_reference(resampled, reference):
     """
     Décale circulairement et inverse éventuellement le sens de resampled pour minimiser la distance à reference.
@@ -222,6 +324,19 @@ def align_resampled_to_reference(resampled, reference):
                 best = res_shift
                 best_dist = dist
     return [tuple(pt) for pt in best]
+
+def is_visible(attr, force_all_contours=False):
+    if force_all_contours:
+        return True
+    fill = attr.get('fill', None)
+    stroke = attr.get('stroke', None)
+    def is_none_or_transparent(val):
+        if val is None:
+            return False
+        val = val.strip().lower()
+        return val in ['none', 'transparent']
+    return not (is_none_or_transparent(fill) and is_none_or_transparent(stroke))
+
 
 def resample_polygon(points, n):
     """
@@ -264,7 +379,7 @@ def extract_outer_inners_groups_from_svg_paths(root):
     for elem in path_elems:
         try:
             path = parse_path(elem.attrib['d'])
-            subpaths = extract_subpaths(path, nb_pts_smpl=128)
+            subpaths = extract_subpaths(path, nb_pts_smpl=3)
             # pas de simplification RDP pour préserver la douceur des courbes (notamment les ellipses)
             subpaths = [sp for sp in subpaths if len(sp) > 2]
             
@@ -641,6 +756,14 @@ def propagate_attributes(elem, inherited=None):
             if attr not in elem.attrib:
                 elem.attrib[attr] = value
 
+def to_original_coords(pt, svg_scale, svg_min_x, svg_min_y):
+            if svg_scale and svg_scale != 0:
+                x = pt[0] / svg_scale + svg_min_x
+                y = pt[1] / svg_scale + svg_min_y
+                return (x, y)
+            else:
+                return pt
+
 def normalize_svg_fill(svg_file_path, debug_dir=None):
 
     tree = ET.parse(svg_file_path)
@@ -750,7 +873,7 @@ def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=
         return [segment.point(t) for t in np.linspace(0, 1, nb_pts_smpl)]
 
 
-def extract_subpaths(path, nb_pts_smpl):
+def extract_subpaths(path, nb_pts_smpl, bezier_sampling=False):
     """
     Découpe un objet svgpathtools.Path (importé as Svg_Path) en sous-chemins (subpaths) selon les discontinuités.
     Args:
@@ -767,7 +890,10 @@ def extract_subpaths(path, nb_pts_smpl):
             if current_subpath:
                 subpaths.append(current_subpath)
             current_subpath = []
-        pts = adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=2000, tol=0.1)
+        if bezier_sampling:
+            pts = adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=2000, tol=0.1)
+        else:
+            pts = [segment.point(t) for t in np.linspace(0, 1, nb_pts_smpl)]
         for pt in pts:
             current_subpath.append([pt.real, pt.imag])
         prev_end = segment.end
