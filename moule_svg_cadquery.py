@@ -8,16 +8,15 @@ from tqdm import tqdm
 from collections import defaultdict
 from svgpathtools import svg2paths2
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from scipy.spatial import ConvexHull
-from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
+from shapely.geometry import Polygon as ShapelyPolygon
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
 from utils import normalize_svg_fill, extract_subpaths, to_original_coords, \
     is_visible, filter_points, resample_polygon, align_resampled_to_reference, \
-    offset_polygon_along_normals
+    offset_polygon_along_normals, interactive_polygon_simplification
 
 # --- Logger configuration ---
 logger = logging.getLogger("moule_svg_cadquery")
@@ -95,20 +94,20 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, rdp=False, forc
     svg_width = max_x - min_x
     svg_height = max_y - min_y
     if svg_width == 0 and svg_height == 0:
-        scale = 1.0
+        px_per_mm = 1.0
     elif svg_width == 0:
-        scale = (max_dimension - 2 * MARGE) / svg_height
+        px_per_mm = (max_dimension - 2 * MARGE) / svg_height
     elif svg_height == 0:
-        scale = (max_dimension - 2 * MARGE) / svg_width
+        px_per_mm = (max_dimension - 2 * MARGE) / svg_width
     else:
-        scale = (max_dimension - 2 * MARGE) / max(svg_width, svg_height)
+        px_per_mm = (max_dimension - 2 * MARGE) / max(svg_width, svg_height)
 
     cq_wires = []
     wire_to_shape = {}
     for shape_idx, shape_points in enumerate(shapes_data):
         retry = True
         while retry:
-            scaled_points = [((x - min_x) * scale, (y - min_y) * scale) for x, y in shape_points]
+            scaled_points = [((x - min_x) * px_per_mm, (y - min_y) * px_per_mm) for x, y in shape_points]
             filtered_points = filter_points(scaled_points)
             # On prépare la liste des points effectivement utilisés pour le wire (après fermeture)
             # S'assurer que chaque point est un tuple plat (x, y)
@@ -236,7 +235,7 @@ def create_mold_base(svg_wires, margin, base_thickness, border_height, border_th
         logger.info(f"STL de la base (avec bordure) exporté : {base_stl_path}")
     return base_mold
 
-def try_apply_engraving(engraving_obj, method_label, group_idx, mold, base_thickness, export_steps, debug_dir, engraved_indices):
+def direct_extrusion(engraving_obj, method_label, group_idx, mold, base_thickness, export_steps, debug_dir, engraved_indices):
     """
     Tente d'appliquer un engraving (loft ou extrusion), effectue le cut, exporte le STL si demandé, et met à jour les indices gravés.
     Retourne (success, new_mold)
@@ -270,6 +269,7 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
     engraved_indices = []
     grouped_wires = group_wires_by_inclusion(svg_wires, shape_history)
     wire_to_shape = shape_history.get('wire_to_shape', {})
+    px_per_mm = shape_history.get('px_per_mm')
 
     group_counter = 0
     for group_idx, wire_group in grouped_wires:
@@ -290,9 +290,9 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
 
             # 1. Tenter d'abord le loft avec dépouille
             draft_angle_deg = 15  # Angle de dépouille en degrés (modifiable)
-            engraving_loft = loft_with_draft(wire_group, draft_angle_deg, engrave_depth)
+            engraving_loft = loft_with_draft(wire_group, draft_angle_deg, engrave_depth, px_per_mm=px_per_mm)
             logger.debug(f"Type engraving retourné par loft_with_draft: {type(engraving_loft)}")
-            success, mold = try_apply_engraving(
+            success, mold = direct_extrusion(
                 engraving_loft, "loft", group_counter,
                 mold, base_thickness, export_steps,
                 debug_dir, engraved_indices
@@ -318,7 +318,7 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                     face = face_result
                 engraving_extrude = cq.Workplane("XY").add(face).extrude(-engrave_depth)
                 logger.debug(f"Type engraving après extrusion directe: {type(engraving_extrude)}")
-                success, mold = try_apply_engraving(
+                success, mold = direct_extrusion(
                     engraving_extrude, "extrusion", group_counter,
                     mold, base_thickness, export_steps,
                     debug_dir, engraved_indices
@@ -380,21 +380,21 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
         svg_width = max_x - min_x
         svg_height = max_y - min_y
         if svg_width == 0 and svg_height == 0:
-            scale = 1.0
+            px_per_mm = 1.0
         elif svg_width == 0:
-            scale = (max_dim - 2 * MARGE) / svg_height
+            px_per_mm = (max_dim - 2 * MARGE) / svg_height
         elif svg_height == 0:
-            scale = (max_dim - 2 * MARGE) / svg_width
+            px_per_mm = (max_dim - 2 * MARGE) / svg_width
         else:
-            scale = (max_dim - 2 * MARGE) / max(svg_width, svg_height)
+            px_per_mm = (max_dim - 2 * MARGE) / max(svg_width, svg_height)
         # On sauvegarde dans shape_history
-        shape_history['svg_scale'] = scale
+        shape_history['px_per_mm'] = px_per_mm
         shape_history['svg_min_x'] = min_x
         shape_history['svg_min_y'] = min_y
         shape_history['svg_width'] = svg_width
         shape_history['svg_height'] = svg_height
     else:
-        shape_history['svg_scale'] = None
+        shape_history['px_per_mm'] = None
         shape_history['svg_min_x'] = None
         shape_history['svg_min_y'] = None
         shape_history['svg_width'] = None
@@ -471,7 +471,7 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
             grouped[path_idx].append((path_idx, sub_idx))
 
         # Récupération des infos d'échelle pour remettre les polygones dans la viewBox d'origine
-        svg_scale = shape_history.get('svg_scale', None)
+        px_per_mm = shape_history.get('px_per_mm', None)
         svg_min_x = shape_history.get('svg_min_x', 0)
         svg_min_y = shape_history.get('svg_min_y', 0)        
 
@@ -492,8 +492,8 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
                         if (pidx, sidx) == subkeys[0]:
                             engraved = hist.get('engraved', False)
                         # Conversion inverse de l'échelle pour chaque point
-                        if(svg_scale is not None and svg_min_x is not None and svg_min_y is not None):
-                               pts_orig = [to_original_coords(pt, svg_scale, svg_min_x, svg_min_y) for pt in pts]
+                        if(px_per_mm is not None and svg_min_x is not None and svg_min_y is not None):
+                               pts_orig = [to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y) for pt in pts]
                         else:
                             logger.warning("Aucune échelle SVG trouvée, les points ne seront pas remis dans la viewBox d'origine.")
                             pts_orig = pts
@@ -658,14 +658,14 @@ def group_wires_by_inclusion(wires, shape_history=None):
             logger.warning(f"Path index {path_idx} not used in any group, possible issue with SVG structure.")
     return all_groups
 
-def scale_wire_2d(wire, scale_factor):
-    """Retourne une nouvelle wire dilatée/réduite par rapport à son centroïde."""
+def scale_wire_2d(wire, px_per_mm):
+    """Retourne une nouvelle wire dilatée/réduite par rapport à son centroïde (pixels par mm)."""
     pts = np.array([(v.X, v.Y) for v in wire.Vertices()])
     centroid = pts.mean(axis=0)
-    scaled_pts = centroid + (pts - centroid) * scale_factor
+    scaled_pts = centroid + (pts - centroid) * px_per_mm
     return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in scaled_pts])
 
-def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=False):
+def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=True, px_per_mm=1):
     """
     Génère un wire décalé (scaled) à partir d'un wire d'origine, selon la normale locale et un offset.
     Si auto_simplify=True (par défaut), réduit automatiquement l'offset tant que le polygone n'est pas simple (pas d'auto-intersection).
@@ -680,7 +680,8 @@ def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=Fa
     wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
     n_points = len(wire_points)
     # Génération initiale des points offsetés
-    offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
+    offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction,
+                                                 px_per_mm=px_per_mm)
     shapely_poly = ShapelyPolygon(offset_points)
 
     # Si le polygone est simple ou si c'est l'outer, on retourne directement
@@ -696,7 +697,7 @@ def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=Fa
         while not shapely_poly.is_simple and abs(offset_attempt) > min_offset and attempt_counter < max_auto_attempts:
             attempt_counter += 1
             offset_attempt *= 0.5  # Réduction progressive de l'offset
-            offset_points = offset_polygon_along_normals(wire_points, offset_attempt, centroid_direction=centroid_direction)
+            offset_points = offset_polygon_along_normals(wire_points, offset_attempt, centroid_direction, px_per_mm=px_per_mm)
             shapely_poly = ShapelyPolygon(offset_points)
         # Si on a trouvé un polygone simple, on le retourne
         if shapely_poly.is_simple:
@@ -708,113 +709,16 @@ def get_scaled_wire_from_wire(wire, offset, centroid_direction, auto_simplify=Fa
                 aligned = offset_points
             return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
         # Si aucune solution trouvée, offset zéro
-        offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
+        offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction, px_per_mm=px_per_mm)
         shapely_zero = ShapelyPolygon(offset_points_zero)
         resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
         aligned = align_resampled_to_reference(resampled, wire_points)
         return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
 
     # Sinon, on propose à l'utilisateur de gérer l'auto-intersection (logique interactive)
-    max_attempts = 8
-    for attempt in range(max_attempts):
-        if shapely_poly.is_simple:
-            if len(offset_points) < len(wire_points):
-                resampled = resample_polygon(list(shapely_poly.exterior.coords), n_points)
-                aligned = align_resampled_to_reference(resampled, wire_points)
-            else:
-                aligned = offset_points
-                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
-        # Affichage matplotlib avant/après simplification avec boutons interactifs
-        try:
-            user_choice = {'value': None}
+    return interactive_polygon_simplification(shapely_poly, offset, centroid_direction, wire_points, n_points)
 
-            def on_button_clicked(event, choice):
-                user_choice['value'] = choice
-                plt.close()
-
-            fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-            axs[0].set_title('Avant simplification')
-            x, y = shapely_poly.exterior.xy
-            axs[0].plot(x, y, 'r-', label='Original')
-            axs[0].fill(x, y, alpha=0.2, color='red')
-            axs[0].axis('equal')
-            # Simplification avec buffer(0)
-            simple_poly = shapely_poly.buffer(0)
-            axs[1].set_title('Après simplification (buffer(0))')
-            if isinstance(simple_poly, MultiPolygon):
-                for poly in simple_poly.geoms:
-                    x2, y2 = poly.exterior.xy
-                    axs[1].plot(x2, y2, 'g-')
-                    axs[1].fill(x2, y2, alpha=0.2, color='green')
-            elif isinstance(simple_poly, ShapelyPolygon):
-                x2, y2 = simple_poly.exterior.xy
-                axs[1].plot(x2, y2, 'g-')
-                axs[1].fill(x2, y2, alpha=0.2, color='green')
-            axs[1].axis('equal')
-            plt.suptitle(f"Wire offset inner - tentative {attempt+1}")
-
-            # Ajout des boutons sous la figure
-            button_labels = [
-                "Diminueer l'offset",
-                "Simplification OK",
-                "Offset zéro",
-                "Ignorer ce wire"
-            ]
-            actions = ['retry', 'simplify', 'zero', 'ignore']
-            button_axes = []
-            buttons = []
-            n_buttons = len(button_labels)
-            for i, label in enumerate(button_labels):
-                ax_btn = plt.axes([0.1 + 0.2*i, 0.01, 0.18, 0.06])
-                btn = Button(ax_btn, label)
-                btn.on_clicked(lambda event, c=actions[i]: on_button_clicked(event, c))
-                button_axes.append(ax_btn)
-                buttons.append(btn)
-
-            plt.show()
-
-            # Après fermeture de la fenêtre, lire le choix
-            choice = user_choice['value']
-            if choice == 'simplify':
-                # On prend le polygone simplifié (le plus grand si MultiPolygon)
-                if isinstance(simple_poly, MultiPolygon):
-                    largest = max(simple_poly.geoms, key=lambda p: p.area)
-                    simple_poly = largest
-                simple_points = list(simple_poly.exterior.coords)
-                resampled = resample_polygon(simple_points, n_points)
-                aligned = align_resampled_to_reference(resampled, wire_points)
-                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
-            elif choice == 'zero':
-                print("Offset mis à 0 pour ce wire sur demande utilisateur.")
-                offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
-                shapely_zero = ShapelyPolygon(offset_points_zero)
-                resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
-                aligned = align_resampled_to_reference(resampled, wire_points)
-                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
-            elif choice == 'ignore':
-                print("Wire ignoré sur demande utilisateur.")
-                return None
-            else:
-                # Retenter avec un offset plus faible
-                offset = offset * 0.5
-                offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
-                shapely_poly = ShapelyPolygon(offset_points)
-        except Exception as e:
-            print(f"Erreur lors de l'affichage ou de la simplification matplotlib : {e}")
-            # Si erreur, on retente avec offset plus faible
-            offset = offset * 0.5
-            offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction=centroid_direction)
-            shapely_poly = ShapelyPolygon(offset_points)
-    # Si aucune solution trouvée, offset zéro
-    print("Offset mis à 0 pour ce wire après toutes les tentatives.")
-    offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction=centroid_direction)
-    shapely_zero = ShapelyPolygon(offset_points_zero)
-    resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
-    aligned = align_resampled_to_reference(resampled, wire_points)
-    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
-
-
-def loft_with_draft(wire_group, draft_angle_deg, depth):
+def loft_with_draft(wire_group, draft_angle_deg, depth, px_per_mm=1, debug_plot=False):
     """
     Réalise un loft avec dépouille pour chaque wire du groupe (contour principal et éventuels trous).
     Pour chaque wire (contour) :
@@ -836,43 +740,36 @@ def loft_with_draft(wire_group, draft_angle_deg, depth):
         offset_initial = abs(depth) * math.tan(math.radians(draft_angle_deg))
         logger.debug(f"[loft_with_draft] Début du loft individuel. Nombre de wires: {len(wire_group)}")
         lofted_solids = []
-        # --- Affichage interactif matplotlib des polygones ---
-        fig, ax = plt.subplots()
-        # Affichage du wire non modifié (contour principal en noir, inners en noir aussi)
-        for wire_index, wire in enumerate(wire_group):
-            wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
-            xs, ys = zip(*wire_points)
-            if wire_index == 0:
-                ax.plot(xs, ys, color='black', linewidth=2, label='Wire original (outer)')
-            else:
-                ax.plot(xs, ys, color='black', linestyle='--', linewidth=1, label='Wire original (inner)' if wire_index == 1 else None)
-        # Affichage du wire outer décalé en bleu
-        outer_scaled_wire = get_scaled_wire_from_wire(wire_group[0], offset_initial, 1)
-        if outer_scaled_wire is not None:
-            outer_scaled_points = [(v.X, v.Y) for v in outer_scaled_wire.Vertices()]
-            xs, ys = zip(*outer_scaled_points)
-            ax.plot(xs, ys, color='blue', linewidth=2, label='Wire outer décalé')
-        # Affichage des wires inners décalés en marron
-        for wire_index, wire in enumerate(wire_group[1:], start=1):
-            inner_scaled_wire = get_scaled_wire_from_wire(wire, offset_initial, -1)
-            if inner_scaled_wire is not None:
-                inner_scaled_points = [(v.X, v.Y) for v in inner_scaled_wire.Vertices()]
-                xs, ys = zip(*inner_scaled_points)
-                ax.plot(xs, ys, color='brown', linewidth=2, label='Wire inner décalé' if wire_index == 1 else None)
-        ax.set_aspect('equal')
-        ax.set_title("Polygones pour le loft avec dépouille")
-        handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys())
-        plt.show()
-        # --- Fin affichage interactif ---
+        # --- Affichage interactif wire par wire juste avant le loft/cut ---
 
         # Parcours de chaque wire du groupe (contour principal + trous)
         for wire_index, wire in enumerate(wire_group):
-            # Sens de l'offset : +1 pour outer, -1 pour inners
             centroid_direction = 1 if wire_index == 0 else -1
-            # Outer : une seule tentative avec l'offset initial, inners : gestion interactive dans get_scaled_wire_from_wire
             scaled_wire = get_scaled_wire_from_wire(wire, offset_initial, centroid_direction)
+            # Affichage interactif du wire original et du wire décalé
+            fig, ax = plt.subplots()
+            # Wire original
+            wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
+            xs, ys = zip(*wire_points)
+            if centroid_direction == 1:
+                ax.plot(xs, ys, color='black', linewidth=2, label='Wire original (outer)')
+            else:
+                ax.plot(xs, ys, color='black', linestyle='--', linewidth=1, label='Wire original (inner)')
+            # Wire décalé
+            if scaled_wire is not None:
+                scaled_points = [(v.X, v.Y) for v in scaled_wire.Vertices()]
+                xs2, ys2 = zip(*scaled_points)
+                if centroid_direction == 1:
+                    ax.plot(xs2, ys2, color='blue', linewidth=2, label='Wire outer décalé')
+                else:
+                    ax.plot(xs2, ys2, color='brown', linewidth=2, label='Wire inner décalé')
+            ax.set_aspect('equal')
+            ax.set_title(f"Wire {wire_index} : original et décalé")
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys())
+            if debug_plot:
+                plt.show()
             # Si l'utilisateur a choisi d'ignorer ce wire, on saute la création
             if scaled_wire is None:
                 logger.info(f"Wire {wire_index} ignoré, aucune gravure ne sera réalisée pour ce trou.")

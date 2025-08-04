@@ -4,9 +4,11 @@ import logging
 import cairosvg
 import xml.etree.ElementTree as ET
 import numpy as np
+import cadquery as cq
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 from scipy.spatial import procrustes
-from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
 from svgpathtools import parse_path, Path as Svg_Path, Line, CubicBezier, QuadraticBezier, Arc
 from PIL import Image
 from io import BytesIO
@@ -217,22 +219,24 @@ def polygon_signed_area(points):
         area += (x0 * y1) - (x1 * y0)
     return area / 2.0
 
-def offset_polygon_along_normals(points, offset_distance, centroid_direction, logger=None):
+def offset_polygon_along_normals(points, offset_distance, centroid_direction, px_per_mm=1, merge_close_points=True, logger=None):
     if logger is None:
         logger = logging.getLogger(__name__)
-    # Filtre les points dupliqués consécutifs pour éviter les artefacts
+    # Filtre les points dupliqués consécutifs pour éviter les artefacts (en mm)
+    # Valeurs minimales raisonnables en mm (ex: 0.01 mm = 10 microns)
+    min_dist_mm = 0.01
+    min_dist_px = min_dist_mm * px_per_mm
     filtered_points = [points[0]]
     for pt in points[1:]:
-        if np.linalg.norm(np.array(pt) - np.array(filtered_points[-1])) > 1e-10:
+        if np.linalg.norm(np.array(pt) - np.array(filtered_points[-1])) > min_dist_px:
             filtered_points.append(pt)
     points = filtered_points
+    # --- Fermeture explicite du polygone si besoin ---
+    if not np.allclose(points[0], points[-1]):
+        points = points + [points[0]]
     pts = np.array(points)
     num_points = len(pts)
-    # S'assurer que le polygone est fermé (premier et dernier point identiques)
-    if not np.allclose(pts[0], pts[-1]):
-        closed_pts = np.vstack([pts, pts[0]])
-    else:
-        closed_pts = pts
+    closed_pts = pts
     # Détermination de l'orientation du polygone (aire signée)
     area = polygon_signed_area(points)
     is_ccw = area > 0  # True si anti-horaire
@@ -247,60 +251,293 @@ def offset_polygon_along_normals(points, offset_distance, centroid_direction, lo
         logger.warning("Polygone d'origine non simple, offset ignoré.")
         return list(points) + [points[0]]
 
-    min_offset = 1e-6
+    min_offset_mm = 0.01  # 10 microns
+    min_offset = min_offset_mm * px_per_mm
     max_iter = 16
     offset_points = [None] * num_points
-    for i in range(num_points):
-        prev_point = closed_pts[(i - 1) % num_points]
-        current_point = closed_pts[i]
-        next_point = closed_pts[(i + 1) % num_points]
-        # Calcul des vecteurs des segments adjacents
+    # Gestion spéciale pour le cas où le polygone est fermé (premier et dernier point identiques)
+    is_closed = np.allclose(closed_pts[0], closed_pts[-1])
+    if is_closed and num_points > 2:
+        # --- Cas d'un polygone fermé ---
+        # On calcule la normale une seule fois pour le premier ET le dernier point,
+        # à partir des points 0 (départ), 1 (suivant) et -2 (avant-dernier).
+        # Ceci garantit que le premier et le dernier point déplacés seront strictement identiques, assurant la fermeture topologique.
+        # --- Recherche robuste des deux voisins non confondus pour le point 0 (et -1) ---
+        # Ceci garantit une normale correcte même si plusieurs points consécutifs sont confondus (ex : cercle parfait ou artefacts de sampling)
+        current_point = closed_pts[0]
+        # Cherche l'avant-dernier point distinct de 0 (en remontant la liste)
+        prev_idx = -2
+        while np.allclose(closed_pts[0], closed_pts[prev_idx]) and abs(prev_idx) < num_points:
+            prev_idx -= 1
+        prev_point = closed_pts[prev_idx]
+        # Cherche le premier point suivant distinct de 0 (en avançant dans la liste)
+        next_idx = 1
+        while np.allclose(closed_pts[0], closed_pts[next_idx]) and next_idx < num_points-1:
+            next_idx += 1
+        next_point = closed_pts[next_idx]
+        # Calcul des vecteurs vers les voisins (permet de gérer les cas de points dupliqués)
         vec_prev = current_point - prev_point
         vec_next = next_point - current_point
-        # Calcul des normales locales aux segments
-        normal_prev = np.array([-vec_prev[1], vec_prev[0]])
-        normal_next = np.array([-vec_next[1], vec_next[0]])
+        # Calcul des normales à chaque segment (normale = rotation de 90° du vecteur, orientée selon centroid_direction)
+        normal_prev = centroid_direction * np.array([-vec_prev[1], vec_prev[0]])
+        normal_next = centroid_direction * np.array([-vec_next[1], vec_next[0]])
         norm_prev = np.linalg.norm(normal_prev)
         norm_next = np.linalg.norm(normal_next)
-        if norm_prev < 1e-10 or norm_next < 1e-10:
-            # Cas dégénéré : un des segments est trop court
-            normal = normal_prev if norm_next < 1e-10 else normal_next
-            if np.linalg.norm(normal) < 1e-10:
+        # Gestion des cas dégénérés (segments trop courts : on prend la normale du segment non nul, ou une direction arbitraire)
+        if norm_prev < min_dist_px or norm_next < min_dist_px:
+            normal = normal_prev if norm_next < min_dist_px else normal_next
+            if np.linalg.norm(normal) < min_dist_px:
+                # Si les deux segments sont trop courts, direction arbitraire (ex : tous les points confondus)
                 normal = np.array([1.0, 0.0])
         else:
-            # Moyenne des normales pour lisser la direction locale
+            # Sinon, on fait la moyenne des deux normales (lissage pour éviter les artefacts anguleux)
             normal_prev /= norm_prev
             normal_next /= norm_next
             normal = (normal_prev + normal_next)
-            if np.linalg.norm(normal) < 1e-8:
+            if np.linalg.norm(normal) < min_dist_px:
+                # Si la moyenne est dégénérée, on garde la première
                 normal = normal_prev
             else:
                 normal /= np.linalg.norm(normal)
+        # --- Application de l'offset au premier point (et donc au dernier) ---
         offset_local = float(offset_distance)
         for attempt in range(max_iter):
-            # Offset toujours dans le sens centroid_direction
-            # Cela garantit que l'outer est toujours vers l'extérieur et l'inner vers l'intérieur,
-            # indépendamment de l'orientation initiale du polygone.
             final_offset = offset_local * centroid_direction
             candidate_point = tuple(current_point + final_offset * normal)
-            # On teste le polygone avec ce point déplacé
+            # On construit la liste des points testés pour vérifier la simplicité
             test_points = [offset_points[j] if (offset_points[j] is not None) else tuple(closed_pts[j]) for j in range(num_points)]
-            test_points[i] = candidate_point
+            test_points[0] = candidate_point
+            test_points[-1] = candidate_point  # Appliquer la même valeur au dernier point
             test_points_closed = test_points + [test_points[0]]
             poly = ShapelyPolygon(test_points_closed)
             if poly.is_simple:
-                offset_points[i] = candidate_point
+                # Si pas d'auto-intersection dans la direction de la normale, on valide
+                offset_points[0] = candidate_point
+                offset_points[-1] = candidate_point
                 break
             else:
-                # Si auto-intersection, on réduit l'offset localement
-                offset_local *= 0.5
+                # On ne réduit l'offset que si l'auto-intersection se produit dans la direction de la normale
+                offset_local *= 0.33
                 if abs(offset_local) < min_offset:
-                    logger.warning(f"Offset trop faible pour le point {i}, auto-intersection persistante.")
-                    offset_points[i] = tuple(current_point)
+                    logger.warning(f"Offset trop faible pour le point 0, auto-intersection persistante.")
+                    offset_points[0] = tuple(current_point)
+                    offset_points[-1] = tuple(current_point)
                     break
+        # --- Traitement des points intermédiaires (hors premier et dernier) ---
+        for i in range(1, num_points - 1):
+            prev_point = closed_pts[i - 1]
+            current_point = closed_pts[i]
+            next_point = closed_pts[(i + 1) % (num_points - 1)]
+            # Calcul des vecteurs vers les voisins
+            vec_prev = current_point - prev_point
+            vec_next = next_point - current_point
+            # Calcul des normales à chaque segment
+            normal_prev = centroid_direction * np.array([-vec_prev[1], vec_prev[0]])
+            normal_next = centroid_direction * np.array([-vec_next[1], vec_next[0]])
+            norm_prev = np.linalg.norm(normal_prev)
+            norm_next = np.linalg.norm(normal_next)
+            # Gestion des cas dégénérés (segments trop courts)
+            if norm_prev < min_dist_px or norm_next < min_dist_px:
+                normal = normal_prev if norm_next < min_dist_px else normal_next
+                if np.linalg.norm(normal) < min_dist_px:
+                    normal = np.array([1.0, 0.0])
+            else:
+                normal_prev /= norm_prev
+                normal_next /= norm_next
+                normal = (normal_prev + normal_next)
+                if np.linalg.norm(normal) < min_dist_px:
+                    normal = normal_prev
+                else:
+                    normal /= np.linalg.norm(normal)
+            # --- Application de l'offset au point courant ---
+            offset_local = float(offset_distance)
+            for attempt in range(max_iter):
+                final_offset = offset_local * centroid_direction
+                candidate_point = tuple(current_point + final_offset * normal)
+                test_points = [offset_points[j] if (offset_points[j] is not None) else tuple(closed_pts[j]) for j in range(num_points)]
+                test_points[i] = candidate_point
+                test_points_closed = test_points + [test_points[0]]
+                poly = ShapelyPolygon(test_points_closed)
+                if poly.is_simple:
+                    offset_points[i] = candidate_point
+                    break
+                else:
+                    offset_local *= 0.5
+                    if abs(offset_local) < min_offset:
+                        logger.warning(f"Offset trop faible pour le point {i}, auto-intersection persistante.")
+                        offset_points[i] = tuple(current_point)
+                        break
+    else:
+        # Polygone ouvert ou non fermé : traitement standard
+        for i in range(num_points):
+            prev_point = closed_pts[(i - 1) % num_points]
+            current_point = closed_pts[i]
+            next_point = closed_pts[(i + 1) % num_points]
+            vec_prev = current_point - prev_point
+            vec_next = next_point - current_point
+            normal_prev = centroid_direction * np.array([-vec_prev[1], vec_prev[0]])
+            normal_next = centroid_direction * np.array([-vec_next[1], vec_next[0]])
+            norm_prev = np.linalg.norm(normal_prev)
+            norm_next = np.linalg.norm(normal_next)
+            if norm_prev < min_dist_px or norm_next < min_dist_px:
+                normal = normal_prev if norm_next < min_dist_px else normal_next
+                if np.linalg.norm(normal) < min_dist_px:
+                    normal = np.array([1.0, 0.0])
+            else:
+                normal_prev /= norm_prev
+                normal_next /= norm_next
+                normal = (normal_prev + normal_next)
+                if np.linalg.norm(normal) < min_dist_px:
+                    normal = normal_prev
+                else:
+                    normal /= np.linalg.norm(normal)
+            offset_local = float(offset_distance)
+            for attempt in range(max_iter):
+                final_offset = offset_local * centroid_direction
+                candidate_point = tuple(current_point + final_offset * normal)
+                test_points = [offset_points[j] if (offset_points[j] is not None) else tuple(closed_pts[j]) for j in range(num_points)]
+                test_points[i] = candidate_point
+                test_points_closed = test_points + [test_points[0]]
+                poly = ShapelyPolygon(test_points_closed)
+                if poly.is_simple:
+                    offset_points[i] = candidate_point
+                    break
+                else:
+                    offset_local *= 0.5
+                    if abs(offset_local) < min_offset:
+                        logger.warning(f"Offset trop faible pour le point {i}, auto-intersection persistante.")
+                        offset_points[i] = tuple(current_point)
+                        break
+
+    # Si le polygone est fermé, on force le dernier point à être identique au premier après offset
+    if is_closed and len(offset_points) > 1:
+        offset_points[-1] = offset_points[0]
+
+    # Fusionne les points trop proches et resample si demandé
+    n_points = len(offset_points)
+    if merge_close_points and len(offset_points) > 1:
+        filtered_points = [offset_points[0]]
+        for pt in offset_points[1:]:
+            last_pt = filtered_points[-1]
+            if (abs(pt[0] - last_pt[0]) > min_dist_px) or (abs(pt[1] - last_pt[1]) > min_dist_px):
+                filtered_points.append(pt)
+        # Si le polygone est fermé, vérifier le dernier point
+        if (len(filtered_points) > 2
+                   and (abs(filtered_points[0][0] - filtered_points[-1][0]) < min_dist_px)
+                and (abs(filtered_points[0][1] - filtered_points[-1][1]) < min_dist_px)):
+            filtered_points.pop()
+        # Resample pour retrouver le nombre de points initial
+        offset_points = resample_polygon(filtered_points, n_points)
+
     # On ferme le polygone
-    offset_points.append(offset_points[0])
+    if(offset_points[0] != offset_points[-1]):
+        offset_points.append(offset_points[0])
+
     return offset_points
+
+
+def interactive_polygon_simplification(shapely_poly, offset, centroid_direction, wire_points, n_points, px_per_mm=1):
+    """
+    Gère la simplification interactive d'un polygone non simple via matplotlib et boutons.
+    Retourne un wire CadQuery ou None selon le choix utilisateur.
+    """
+    max_attempts = 8
+    offset_points = list(shapely_poly.exterior.coords)
+    for attempt in range(max_attempts):
+        if shapely_poly.is_simple:
+            if len(offset_points) < len(wire_points):
+                resampled = resample_polygon(list(shapely_poly.exterior.coords), n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+            else:
+                aligned = offset_points
+            return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+        # Affichage matplotlib avant/après simplification avec boutons interactifs
+        try:
+            user_choice = {'value': None}
+
+            def on_button_clicked(event, choice):
+                user_choice['value'] = choice
+                plt.close()
+
+            fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+            axs[0].set_title('Avant simplification')
+            x, y = shapely_poly.exterior.xy
+            axs[0].plot(x, y, 'r-', label='Original')
+            axs[0].fill(x, y, alpha=0.2, color='red')
+            axs[0].axis('equal')
+            # Simplification avec buffer(0)
+            simple_poly = shapely_poly.buffer(0)
+            axs[1].set_title('Après simplification (buffer(0))')
+            if isinstance(simple_poly, MultiPolygon):
+                for poly in simple_poly.geoms:
+                    x2, y2 = poly.exterior.xy
+                    axs[1].plot(x2, y2, 'g-')
+                    axs[1].fill(x2, y2, alpha=0.2, color='green')
+            elif isinstance(simple_poly, ShapelyPolygon):
+                x2, y2 = simple_poly.exterior.xy
+                axs[1].plot(x2, y2, 'g-')
+                axs[1].fill(x2, y2, alpha=0.2, color='green')
+            axs[1].axis('equal')
+            plt.suptitle(f"Wire offset inner - tentative {attempt+1}")
+
+            # Ajout des boutons sous la figure
+            button_labels = [
+                "Diminueer l'offset",
+                "Simplification OK",
+                "Offset zéro",
+                "Ignorer ce wire"
+            ]
+            actions = ['retry', 'simplify', 'zero', 'ignore']
+            button_axes = []
+            buttons = []
+            for i, label in enumerate(button_labels):
+                ax_btn = plt.axes([0.1 + 0.2*i, 0.01, 0.18, 0.06])
+                btn = Button(ax_btn, label)
+                btn.on_clicked(lambda event, c=actions[i]: on_button_clicked(event, c))
+                button_axes.append(ax_btn)
+                buttons.append(btn)
+
+            plt.show()
+
+            # Après fermeture de la fenêtre, lire le choix
+            choice = user_choice['value']
+            if choice == 'simplify':
+                # On prend le polygone simplifié (le plus grand si MultiPolygon)
+                if isinstance(simple_poly, MultiPolygon):
+                    largest = max(simple_poly.geoms, key=lambda p: p.area)
+                    simple_poly = largest
+                simple_points = list(simple_poly.exterior.coords)
+                resampled = resample_polygon(simple_points, n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+            elif choice == 'zero':
+                print("Offset mis à 0 pour ce wire sur demande utilisateur.")
+                offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction, px_per_mm=px_per_mm)
+                shapely_zero = ShapelyPolygon(offset_points_zero)
+                resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
+                aligned = align_resampled_to_reference(resampled, wire_points)
+                return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
+            elif choice == 'ignore':
+                print("Wire ignoré sur demande utilisateur.")
+                return None
+            else:
+                # Retenter avec un offset plus faible
+                offset = offset * 0.5
+                offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction, px_per_mm=px_per_mm)
+                shapely_poly = ShapelyPolygon(offset_points)
+        except Exception as e:
+            print(f"Erreur lors de l'affichage ou de la simplification matplotlib : {e}")
+            # Si erreur, on retente avec offset plus faible
+            offset = offset * 0.5
+            offset_points = offset_polygon_along_normals(wire_points, offset, centroid_direction, px_per_mm=px_per_mm)
+            shapely_poly = ShapelyPolygon(offset_points)
+    # Si aucune solution trouvée, offset zéro
+    print("Offset mis à 0 pour ce wire après toutes les tentatives.")
+    offset_points_zero = offset_polygon_along_normals(wire_points, 0, centroid_direction, px_per_mm=px_per_mm)
+    shapely_zero = ShapelyPolygon(offset_points_zero)
+    resampled = resample_polygon(list(shapely_zero.exterior.coords), n_points)
+    aligned = align_resampled_to_reference(resampled, wire_points)
+    return cq.Wire.makePolygon([cq.Vector(x, y) for x, y in aligned])
 
 def align_resampled_to_reference(resampled, reference):
     """
@@ -756,13 +993,13 @@ def propagate_attributes(elem, inherited=None):
             if attr not in elem.attrib:
                 elem.attrib[attr] = value
 
-def to_original_coords(pt, svg_scale, svg_min_x, svg_min_y):
-            if svg_scale and svg_scale != 0:
-                x = pt[0] / svg_scale + svg_min_x
-                y = pt[1] / svg_scale + svg_min_y
-                return (x, y)
-            else:
-                return pt
+def to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y):
+    if px_per_mm and px_per_mm != 0:
+        x = pt[0] / px_per_mm + svg_min_x
+        y = pt[1] / px_per_mm + svg_min_y
+        return (x, y)
+    else:
+        return pt
 
 def normalize_svg_fill(svg_file_path, debug_dir=None):
 
