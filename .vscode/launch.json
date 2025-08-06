@@ -8,11 +8,59 @@
       "program": "${workspaceFolder}/main.py",
       "args": [
         "--svg",
-        "${workspaceFolder}/svgs/le_chat_applat.svg",
+        "${workspaceFolder}/svgs/le_chat.svg",
         "--size",
         "40",
         "--output",
         "${workspaceFolder}/stls/moule_chat.stl",
+        "--keep-debug-files"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Débogueur Python : Fichier chat_applati STL",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/svgs/le_chat_applat.svg",
+        "--size",
+        "40",
+        "--output",
+        "${workspaceFolder}/stls/moule_chat_applati.stl",
+        "--keep-debug-files"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Débogueur Python : Fichier bonamour",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/svgs/bonamour.svg",
+        "--size",
+        "60",
+        "--output",
+        "${workspaceFolder}/stls/bonamour.stl",
+        "--keep-debug-files"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Débogueur Python : Fichier bas_page",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "--svg",
+        "${workspaceFolder}/svgs/bas_page.svg",
+        "--size",
+        "60",
+        "--output",
+        "${workspaceFolder}/stls/bas_page.stl",
         "--keep-debug-files"
       ],
       "console": "integratedTerminal"

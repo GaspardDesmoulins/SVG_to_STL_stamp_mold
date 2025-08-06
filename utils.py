@@ -2,6 +2,7 @@ import re
 import os
 import logging
 import cairosvg
+import time
 import xml.etree.ElementTree as ET
 import numpy as np
 import cadquery as cq
@@ -13,6 +14,7 @@ from svgpathtools import parse_path, Path as Svg_Path, Line, CubicBezier, Quadra
 from PIL import Image
 from io import BytesIO
 from shapely.geometry import Polygon
+import re
 
 def strip_namespace(tag):
     """
@@ -997,11 +999,23 @@ def find_parent(root, child):
             return parent
     return None
 
-def write_svg_to_file(svg, filepath):
-    tmp_file_path = os.path.splitext(filepath)[0] + "_normalized.svg"
-    with open(tmp_file_path, "w") as f:
+def write_svg_to_file(svg, svg_filepath, debug_dir=None):
+    if debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(svg_filepath))[0]
+        normd_file_path = os.path.join(debug_dir, f"{base_name}_normalized.svg")
+    else:
+        normd_file_path = os.path.splitext(svg_filepath)[0] + "_normalized.svg"
+    with open(normd_file_path, "w", encoding="utf-8") as f:
         f.write(svg)
-    return tmp_file_path
+        for _ in range(20):
+            try:
+                with open(normd_file_path, "rb") as test_f:
+                    test_f.read(1)
+                break
+            except PermissionError:
+                time.sleep(0.5)
+    return normd_file_path
 
 def propagate_attributes(elem, inherited=None):
     """
@@ -1031,23 +1045,113 @@ def to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y):
     else:
         return pt
 
-def normalize_svg_fill(svg_file_path, debug_dir=None):
 
+def normalize_svg_fill(svg_file_path, debug_dir=None, shape_history=None):
+    """
+    Normalise un SVG :
+    - Convertit les <rect> et <ellipse> en <path>
+    - Aplati les transformations
+    - Centre le contenu et ajuste le viewBox
+    - Regroupe les outers/inners
+    - Génère un SVG propre et normalisé
+    """
     tree = ET.parse(svg_file_path)
     root = tree.getroot()
 
-    # Conversion des rectangles et ellipses en paths avant toute opération
     convert_rect_ellipse_to_path(root)
-
-    # --- Aplatissement des transformations SVG (logique de flatten_svg_transforms) ---
     flatten_tree(root)
+    min_x, min_y, max_x, max_y = _get_svg_content_bbox(root)
+    if min_x is not None and min_y is not None and max_x is not None and max_y is not None:
+        _center_svg_content(root, min_x, min_y)
+        width = max_x - min_x
+        height = max_y - min_y
+        root.attrib['viewBox'] = f"0 0 {width} {height}"
+    else:
+        width = height = 1000
+        root.attrib['viewBox'] = f"0 0 1000 1000"
 
+    if shape_history is not None:
+        shape_history['viewBox'] = f"0 0 {width} {height}"
+
+
+    _set_svg_root_attributes(root)
+    _remove_namespaces_and_metadata(root)
+    propagate_attributes(root)
+    all_groups = extract_outer_inners_groups_from_svg_paths(root)
+    new_root = _build_normalized_svg_root(root, all_groups)
+    normalized_svg = _svg_to_string(new_root)
+    normalized_svg = _patch_svg_header(normalized_svg, width, height)
+
+    normd_file_path = write_svg_to_file(normalized_svg, svg_file_path, debug_dir=debug_dir)
+    return normd_file_path
+
+def _get_svg_content_bbox(root):
+    """
+    Calcule le bounding box (min_x, min_y, max_x, max_y) de tous les paths du SVG.
+    Utile pour recaler et ajuster le viewBox automatiquement.
+    """
+    min_x = min_y = max_x = max_y = None
+    for elem in root.iter():
+        if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
+            path = parse_path(elem.attrib['d'])
+            for seg in path:
+                xs = [pt.real for pt in [seg.start, seg.end] if hasattr(seg, 'start') and hasattr(seg, 'end')]
+                ys = [pt.imag for pt in [seg.start, seg.end] if hasattr(seg, 'start') and hasattr(seg, 'end')]
+                if hasattr(seg, 'control1'):
+                    xs.append(seg.control1.real)
+                    ys.append(seg.control1.imag)
+                if hasattr(seg, 'control2'):
+                    xs.append(seg.control2.real)
+                    ys.append(seg.control2.imag)
+                if hasattr(seg, 'control'):
+                    xs.append(seg.control.real)
+                    ys.append(seg.control.imag)
+                for x, y in zip(xs, ys):
+                    if min_x is None or x < min_x:
+                        min_x = x
+                    if min_y is None or y < min_y:
+                        min_y = y
+                    if max_x is None or x > max_x:
+                        max_x = x
+                    if max_y is None or y > max_y:
+                        max_y = y
+    return min_x, min_y, max_x, max_y
+
+def _center_svg_content(root, min_x, min_y):
+    """
+    Translate tous les paths du SVG pour que le contenu commence à (0,0).
+    Applique la translation à chaque point de chaque path.
+    """
+    tx, ty = -min_x, -min_y
+    print(f"[DEBUG] Centrage automatique : translation ({tx}, {ty}) appliquée à tous les paths")
+    for elem in root.iter():
+        if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
+            path = parse_path(elem.attrib['d'])
+            new_path = Svg_Path()
+            for seg in path:
+                def tr(pt):
+                    return complex(pt.real + tx, pt.imag + ty)
+                if isinstance(seg, Line):
+                    new_path.append(Line(tr(seg.start), tr(seg.end)))
+                elif isinstance(seg, CubicBezier):
+                    new_path.append(CubicBezier(tr(seg.start), tr(seg.control1), tr(seg.control2), tr(seg.end)))
+                elif isinstance(seg, QuadraticBezier):
+                    new_path.append(QuadraticBezier(tr(seg.start), tr(seg.control), tr(seg.end)))
+                elif isinstance(seg, Arc):
+                    new_path.append(Line(tr(seg.start), tr(seg.end)))
+                else:
+                    new_path.append(seg)
+            elem.attrib['d'] = new_path.d()
+
+def _set_svg_root_attributes(root):
+    """
+    Met à jour les attributs principaux de la racine SVG (xmlns, version, etc.)
+    et les place en tête pour garantir la compatibilité.
+    """
     ns = 'http://www.w3.org/2000/svg'
     root.tag = 'svg'
     root.attrib['version'] = '1.0'
     root.attrib['xmlns'] = ns
-
-    # Réordonner les attributs pour que version et xmlns soient en premier
     def order_svg_attribs(attribs):
         ordered = [('version', attribs.get('version', '1.0')), ('xmlns', attribs.get('xmlns', ns))]
         for k, v in attribs.items():
@@ -1059,56 +1163,64 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
     for k, v in order_svg_attribs(attribs_dict):
         root.set(k, v)
 
-    # On retire le namespace des balises enfants uniquement (pas la racine)
+def _remove_namespaces_and_metadata(root):
+    """
+    Supprime les namespaces des balises enfants et retire les balises metadata, desc, title.
+    Nettoie le SVG pour éviter les artefacts inutiles.
+    """
     for elem in root.iter():
         if elem is not root:
             elem.tag = strip_namespace(elem.tag)
             elem.attrib = {strip_namespace(k): v for k, v in elem.attrib.items()}
-
-    propagate_attributes(root)
-
     for bad_tag in ['metadata', 'desc', 'title']:
         for elem in root.findall(f'.//{bad_tag}'):
             parent = find_parent(root, elem)
             if parent is not None:
                 parent.remove(elem)
 
-    # --- Regroupement outer/inners via fonction dédiée ---
-    all_groups = extract_outer_inners_groups_from_svg_paths(root)
-
-    # On crée un nouveau SVG avec un path par groupe (outer + inners)
+def _build_normalized_svg_root(root, all_groups):
+    """
+    Construit un nouvel arbre SVG avec un path par groupe (outer + inners),
+    en concaténant les d de chaque sous-groupe.
+    """
     new_root = ET.Element('svg', dict(root.attrib))
-    # Copie viewBox, width, height si présents
     for attr in ['viewBox', 'width', 'height']:
         if attr in root.attrib:
             new_root.attrib[attr] = root.attrib[attr]
-
     for group in all_groups:
-        # Crée un nouveau path pour l'outer
         outer_elem = group['outer']['elem']
         new_path = ET.Element('path', dict(outer_elem.attrib))
-        # Concatène le d de l'outer et des inners
         d_concat = group['outer']['d']
         for inner in group['inners']:
             d_concat += ' ' + inner['d']
         new_path.attrib['d'] = d_concat
         new_root.append(new_path)
+    return new_root
 
-    # Générer le SVG sans déclaration XML ni doctype
+def _svg_to_string(new_root):
+    """
+    Convertit l'arbre XML SVG en string, sans déclaration XML ni doctype.
+    """
     normalized_svg = ET.tostring(new_root, encoding='unicode', method='xml')
-    # Supprimer toute déclaration XML ou doctype si présente
     normalized_svg = re.sub(r'<\?xml[^>]*>\s*', '', normalized_svg)
     normalized_svg = re.sub(r'<!DOCTYPE[^>]*>\s*', '', normalized_svg)
+    return normalized_svg
 
-    if debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        base_name = os.path.splitext(os.path.basename(svg_file_path))[0]
-        normd_file_path = os.path.join(debug_dir, f"{base_name}_normalized.svg")
-        with open(normd_file_path, "w", encoding="utf-8") as f:
-            f.write(normalized_svg)
-    else:
-        normd_file_path = write_svg_to_file(normalized_svg, svg_file_path)
-    return normd_file_path
+def _patch_svg_header(normalized_svg, w, h):
+    """
+    Remplace l'en-tête <svg> par une version complète avec width, height, viewBox et style par défaut.
+    Garantit un rendu correct dans les éditeurs modernes.
+    """
+    width_str = f'{w:.6f}px'
+    height_str = f'{h:.6f}px'
+    style = 'fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2;'
+    normalized_svg = re.sub(
+        r'<svg([^>]*)>',
+        f'<svg version="1.0" xmlns="http://www.w3.org/2000/svg" width="{width_str}" height="{height_str}" viewBox="0 0 {w:.6f} {h:.6f}" style="{style}">',
+        normalized_svg,
+        count=1
+    )
+    return normalized_svg
 
 # Sur-échantillonnage adaptatif pour préserver la douceur des courbes de Bézier
 def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=0.1, px_per_mm=1):

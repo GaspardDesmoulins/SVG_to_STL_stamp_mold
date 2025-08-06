@@ -32,7 +32,7 @@ class TestSVGTransform(unittest.TestCase):
         all_shape_keys = [k for k, v in shape_history.items() if isinstance(k, tuple) and v.get('engraved')]
         svg_basename = os.path.splitext(os.path.basename(self.svg_file_path))[0]
         summary_svg_final = os.path.join(self.debug_dir, f'summary_{svg_basename}_final.svg')
-        generate_summary_svg(self.svg_file_path, all_shape_keys, summary_svg_final, shape_history=shape_history)
+        generate_summary_svg(all_shape_keys, summary_svg_final, shape_history=shape_history)
         self.assertTrue(os.path.exists(summary_svg_final), "Le SVG de résumé final n'a pas été généré.")
 
         # Chemin du SVG aplati (après normalisation et flatten)

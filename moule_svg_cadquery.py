@@ -2,6 +2,7 @@ import os
 import shutil
 import logging
 import math
+import time
 import cadquery as cq
 import numpy as np
 from tqdm import tqdm
@@ -91,8 +92,50 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, rdp=False, forc
     ys = [pt[1] for pt in all_points]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
-    svg_width = max_x - min_x
-    svg_height = max_y - min_y
+
+    # --- Nouvelle logique : lecture de la largeur du SVG depuis les attributs du fichier SVG ---
+    svg_width = None
+    svg_height = None
+    try:
+        tree = ET.parse(str(svg_file))
+        root = tree.getroot()
+        width_attr = root.attrib.get('width', None)
+        height_attr = root.attrib.get('height', None)
+        viewbox_attr = root.attrib.get('viewBox', None)
+        # Gestion des unités (ex: '100mm', '200px', etc.)
+        def parse_svg_length(val):
+            if val is None:
+                return None
+            try:
+                if val.endswith('mm'):
+                    return float(val.replace('mm',''))
+                elif val.endswith('cm'):
+                    return float(val.replace('cm','')) * 10.0
+                elif val.endswith('px'):
+                    return float(val.replace('px',''))
+                else:
+                    return float(val)
+            except Exception:
+                return None
+        svg_width_attr = parse_svg_length(width_attr)
+        svg_height_attr = parse_svg_length(height_attr)
+        if svg_width_attr is not None and svg_width_attr > 0:
+            svg_width = svg_width_attr
+        else:
+            svg_width = max_x - min_x
+        if svg_height_attr is not None and svg_height_attr > 0:
+            svg_height = svg_height_attr
+        else:
+            svg_height = max_y - min_y
+        # Sauvegarde explicite des attributs d'en-tête pour restauration ultérieure
+        shape_history['width'] = width_attr
+        shape_history['height'] = height_attr
+        shape_history['viewBox'] = viewbox_attr
+    except Exception as e:
+        logger.warning(f"Impossible de lire les attributs width/height du SVG : {e}. Fallback sur bounding box.")
+        svg_width = max_x - min_x
+        svg_height = max_y - min_y
+
     if svg_width == 0 and svg_height == 0:
         px_per_mm = 1.0
     elif svg_width == 0:
@@ -101,6 +144,12 @@ def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, rdp=False, forc
         px_per_mm = (max_dimension - 2 * MARGE) / svg_width
     else:
         px_per_mm = (max_dimension - 2 * MARGE) / max(svg_width, svg_height)
+    # On sauvegarde dans shape_history
+    shape_history['px_per_mm'] = px_per_mm
+    shape_history['svg_min_x'] = min_x
+    shape_history['svg_min_y'] = min_y
+    shape_history['svg_width'] = svg_width
+    shape_history['svg_height'] = svg_height
 
     cq_wires = []
     wire_to_shape = {}
@@ -343,7 +392,7 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
                     current_shape_keys.append(wire_to_shape[global_wire_index])
             if current_shape_keys:
                 summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
-                generate_summary_svg(original_svg_path, current_shape_keys, summary_svg_path, shape_history=shape_history)
+                generate_summary_svg(current_shape_keys, summary_svg_path, shape_history=shape_history)
             else:
                 logger.warning(f"Aucune shape_key trouvée pour le groupe {group_counter}, le SVG de résumé n'a pas été généré.")
         group_counter += 1
@@ -359,46 +408,11 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     os.makedirs(debug_dir, exist_ok=True)
 
     logger.info(f"Normalisation du SVG : {svg_file}")
+    # On force l'utilisation du viewBox d'origine pour garantir la compatibilité avec le résumé SVG
     normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
 
     # Récupération des wires et de l'historique des shapes
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
-
-    # Calcul du rapport d'agrandissement/réduction et du min_x/min_y pour conserver l'échelle d'origine
-    # On récupère tous les points utilisés pour le SVG
-    all_points = []
-    for k in shape_history:
-        if isinstance(k, tuple):
-            pts = shape_history[k].get('simplified_points')
-            if pts:
-                all_points.extend(pts)
-    if all_points:
-        xs = [pt[0] for pt in all_points]
-        ys = [pt[1] for pt in all_points]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        svg_width = max_x - min_x
-        svg_height = max_y - min_y
-        if svg_width == 0 and svg_height == 0:
-            px_per_mm = 1.0
-        elif svg_width == 0:
-            px_per_mm = (max_dim - 2 * MARGE) / svg_height
-        elif svg_height == 0:
-            px_per_mm = (max_dim - 2 * MARGE) / svg_width
-        else:
-            px_per_mm = (max_dim - 2 * MARGE) / max(svg_width, svg_height)
-        # On sauvegarde dans shape_history
-        shape_history['px_per_mm'] = px_per_mm
-        shape_history['svg_min_x'] = min_x
-        shape_history['svg_min_y'] = min_y
-        shape_history['svg_width'] = svg_width
-        shape_history['svg_height'] = svg_height
-    else:
-        shape_history['px_per_mm'] = None
-        shape_history['svg_min_x'] = None
-        shape_history['svg_min_y'] = None
-        shape_history['svg_width'] = None
-        shape_history['svg_height'] = None
 
     # Initialisation du statut 'engraved' pour chaque shape
     for k in shape_history:
@@ -421,7 +435,7 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]
     if all_shape_keys:
         global_summary_svg = os.path.join(debug_dir, f"summary_{svg_basename}_final.svg")
-        generate_summary_svg(svg_file, all_shape_keys, global_summary_svg, shape_history=shape_history)
+        generate_summary_svg(all_shape_keys, global_summary_svg, shape_history=shape_history)
         logger.info(f"Résumé global SVG généré : {global_summary_svg}")
     else:
         logger.warning("Aucune forme trouvée, pas de SVG de résumé global généré.")
@@ -432,30 +446,29 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
 
     return mold, engraved_indices, shape_history
 
-def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_history=None):
+def generate_summary_svg(shape_keys, output_svg_name, shape_history):
     """
     Génère un SVG de résumé en dessinant explicitement chaque shape (polygone) à partir des points simplifiés de shape_history,
     coloré en noir si engraved, rouge sinon. Le SVG généré est vierge et ne contient que les polygones de l'étape.
     """
     logger.info(f"Génération du résumé SVG pour {output_svg_name}")
     logger.debug(f"shape_keys à dessiner: {shape_keys}")
-    if shape_history is not None:
-        for k in shape_keys:
-            hist = shape_history.get(k, None)
-            if hist is not None:
-                logger.debug(f"  - shape_key: {k}, nb_points: {len(hist.get('simplified_points', []))}, attr: {hist.get('svg_attr', {})}")
-    # Lit l'ancien SVG pour récupérer ses attributs (width, height, viewBox)
-    original_tree = ET.parse(original_svg_path)
-    original_root = original_tree.getroot()
-    
+    for k in shape_keys:
+        hist = shape_history.get(k, None)
+        if hist is not None:
+            logger.debug(f"  - shape_key: {k}, nb_points: {len(hist.get('simplified_points', []))}, attr: {hist.get('svg_attr', {})}")
+        
     # Crée un nouvel élément SVG racine, en copiant explicitement viewBox, width, height, xmlns
     ns = 'http://www.w3.org/2000/svg'
     ET.register_namespace('', ns) # Namespace par défaut
     new_root_attribs = {}
-    # Copie viewBox, width, height si présents
-    for attr in ['viewBox', 'width', 'height']:
-        if attr in original_root.attrib:
-            new_root_attribs[attr] = original_root.attrib[attr]
+    # Copie viewBox, width, height si présents (restaure les valeurs d'origine du SVG si elles existent)
+    if shape_history.get('viewBox') is not None:
+        new_root_attribs['viewBox'] = shape_history['viewBox']
+    if shape_history.get('width') is not None:
+        new_root_attribs['width'] = shape_history['width']
+    if shape_history.get('height') is not None:
+        new_root_attribs['height'] = shape_history['height']
     # Ajoute le namespace
     new_root_attribs['xmlns'] = ns
     new_root = ET.Element('svg', new_root_attribs)
@@ -465,61 +478,58 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
     new_root.append(group)
 
     # Nouvelle logique : dessiner tous les paths, même non gravés, en rouge (remplissage) si la gravure a échoué.
-    if shape_history is not None:
-        grouped = defaultdict(list)
-        for (path_idx, sub_idx) in shape_keys:
-            grouped[path_idx].append((path_idx, sub_idx))
+    grouped = defaultdict(list)
+    for (path_idx, sub_idx) in shape_keys:
+        grouped[path_idx].append((path_idx, sub_idx))
 
-        # Récupération des infos d'échelle pour remettre les polygones dans la viewBox d'origine
-        px_per_mm = shape_history.get('px_per_mm', None)
-        svg_min_x = shape_history.get('svg_min_x', 0)
-        svg_min_y = shape_history.get('svg_min_y', 0)        
+    # Récupération des infos d'échelle pour remettre les polygones dans la viewBox d'origine
+    px_per_mm = shape_history.get('px_per_mm', None)
+    svg_min_x = shape_history.get('svg_min_x', 0)
+    svg_min_y = shape_history.get('svg_min_y', 0)        
 
-        for path_idx, subkeys in grouped.items():
-            paths_d = ''
-            engraved = True  # Par défaut
-            for (pidx, sidx) in subkeys:
-                hist = shape_history.get((pidx, sidx), None)
-                if hist is not None:
-                    # On tente d'utiliser extrusion_points, sinon simplified_points, sinon sampled_points
-                    pts = hist.get('extrusion_points')
-                    if not pts or len(pts) < 3:
-                        pts = hist.get('simplified_points')
-                    if not pts or len(pts) < 3:
-                        pts = hist.get('sampled_points')
-                    if pts and len(pts) >= 3:
-                        # On prend le statut engraved du contour extérieur (premier subkey)
-                        if (pidx, sidx) == subkeys[0]:
-                            engraved = hist.get('engraved', False)
-                        # Conversion inverse de l'échelle pour chaque point
-                        if(px_per_mm is not None and svg_min_x is not None and svg_min_y is not None):
-                               pts_orig = [to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y) for pt in pts]
-                        else:
-                            logger.warning("Aucune échelle SVG trouvée, les points ne seront pas remis dans la viewBox d'origine.")
-                            pts_orig = pts
-                        paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts_orig) + ' Z '
-            if paths_d:
-                if engraved:
-                    style = 'fill:black;stroke:none'
-                else:
-                    style = 'fill:red;stroke:none'
-                path_elem = ET.Element('path', {
-                    'd': paths_d.strip(),
-                    'style': style,
-                    'fill-rule': 'evenodd',
-                    'data-pathidx': str(path_idx),
-                })
-                group.append(path_elem)
+    for path_idx, subkeys in grouped.items():
+        paths_d = ''
+        engraved = True  # Par défaut
+        for (pidx, sidx) in subkeys:
+            hist = shape_history.get((pidx, sidx), None)
+            if hist is not None:
+                # On tente d'utiliser extrusion_points, sinon simplified_points, sinon sampled_points
+                pts = hist.get('extrusion_points')
+                if not pts or len(pts) < 3:
+                    pts = hist.get('simplified_points')
+                if not pts or len(pts) < 3:
+                    pts = hist.get('sampled_points')
+                if pts and len(pts) >= 3:
+                    # On prend le statut engraved du contour extérieur (premier subkey)
+                    if (pidx, sidx) == subkeys[0]:
+                        engraved = hist.get('engraved', False)
+                    # Conversion inverse de l'échelle pour chaque point
+                    if(px_per_mm is not None and svg_min_x is not None and svg_min_y is not None):
+                            pts_orig = [to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y) for pt in pts]
+                    else:
+                        logger.warning("Aucune échelle SVG trouvée, les points ne seront pas remis dans la viewBox d'origine.")
+                        pts_orig = pts
+                    paths_d += 'M ' + ' '.join(f'{x},{y}' for x, y in pts_orig) + ' Z '
+        if paths_d:
+            if engraved:
+                style = 'fill:black;stroke:none'
             else:
-                # Si aucun point utilisable, on génère un path vide en marron (stroke)
-                path_elem = ET.Element('path', {
-                    'd': '',
-                    'style': 'fill:brown;stroke:none',
-                    'data-pathidx': str(path_idx),
-                })
-                group.append(path_elem)
-    else:
-        logger.warning("Aucune shape_history fournie pour générer le SVG de résumé.")
+                style = 'fill:red;stroke:none'
+            path_elem = ET.Element('path', {
+                'd': paths_d.strip(),
+                'style': style,
+                'fill-rule': 'evenodd',
+                'data-pathidx': str(path_idx),
+            })
+            group.append(path_elem)
+        else:
+            # Si aucun point utilisable, on génère un path vide en marron (stroke)
+            path_elem = ET.Element('path', {
+                'd': '',
+                'style': 'fill:brown;stroke:none',
+                'data-pathidx': str(path_idx),
+            })
+            group.append(path_elem)
 
     # Écriture du nouveau fichier SVG (toujours à la fin, une seule fois)
     new_tree = ET.ElementTree(new_root)
@@ -528,7 +538,7 @@ def generate_summary_svg(original_svg_path, shape_keys, output_svg_name, shape_h
 
 
 def flatten_cq_solids(obj):
-    """Aplati récursivement une structure de listes, Workplane, Shape pour ne garder que les objets CadQuery valides (ayant .wrapped)."""
+    """Aplatit récursivement une structure de listes, Workplane, Shape pour ne garder que les objets CadQuery valides (ayant .wrapped)."""
     solids = []
     if isinstance(obj, (list, tuple)):
         for item in obj:
