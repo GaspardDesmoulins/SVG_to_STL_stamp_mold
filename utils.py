@@ -605,6 +605,22 @@ def resample_polygon(points, n):
         new_pts.append(tuple(new_pt))
     return new_pts
 
+# Génère le d pour chaque subpath (outer et inners)
+def points_to_d(pts):
+    # Ne pas répéter le point de départ à la fin
+    n = len(pts)
+    if n < 2:
+        return ''
+    path_obj = Svg_Path()
+    for k in range(n-1):
+        start = complex(*pts[k])
+        end = complex(*pts[k+1])
+        path_obj.append(Line(start, end))
+    # Ferme le chemin si ce n'est pas déjà le cas
+    if not (np.allclose(pts[0], pts[-1])):
+        path_obj.append(Line(complex(*pts[-1]), complex(*pts[0])))
+    return path_obj.d()
+
 def extract_outer_inners_groups_from_svg_paths(root):
     """
     Pour chaque path du SVG, découpe en subpaths, identifie l'outer principal et les inners associés selon la règle even-odd.
@@ -660,21 +676,6 @@ def extract_outer_inners_groups_from_svg_paths(root):
                     'outer': {'elem': elem, 'pts': subpaths[outer_idx], 'd': None},
                     'inners': [{'pts': subpaths[i], 'd': None} for i in inners_idx]
                 }
-                # Génère le d pour chaque subpath (outer et inners)
-                def points_to_d(pts):
-                    # Ne pas répéter le point de départ à la fin
-                    n = len(pts)
-                    if n < 2:
-                        return ''
-                    path_obj = Svg_Path()
-                    for k in range(n-1):
-                        start = complex(*pts[k])
-                        end = complex(*pts[k+1])
-                        path_obj.append(Line(start, end))
-                    # Ferme le chemin si ce n'est pas déjà le cas
-                    if not (np.allclose(pts[0], pts[-1])):
-                        path_obj.append(Line(complex(*pts[-1]), complex(*pts[0])))
-                    return path_obj.d()
                 group['outer']['d'] = points_to_d(group['outer']['pts'])
                 for idx, inner in enumerate(group['inners']):
                     inner['d'] = points_to_d(inner['pts'])
@@ -845,19 +846,48 @@ def parse_transform(transform_str):
     """
     if not transform_str:
         return np.eye(3)
-    m = re.search(r"matrix\(([^)]+)\)", transform_str)
-    if m:
-        vals = [float(v) for v in m.group(1).split(",")]
-        if len(vals) == 6:
+    # Découpe la chaîne en transformations successives
+    # Ex : 'translate(10,20) scale(2) matrix(1,0,0,1,5,5)'
+    pattern = r'(matrix|translate|scale)\s*\(([^)]*)\)'
+    matches = re.findall(pattern, transform_str)
+    mat = np.eye(3)
+    for kind, params in matches:
+        vals = [float(v) for v in re.split(r'[ ,]+', params.strip()) if v]
+        if kind == 'matrix' and len(vals) == 6:
             a, b, c, d, e, f = vals
-            mat = np.array([
+            m_local = np.array([
                 [a, c, e],
                 [b, d, f],
                 [0, 0, 1]
             ])
-            return mat
-    # Si pas de matrix, retourne identité
-    return np.eye(3)
+        elif kind == 'translate':
+            if len(vals) == 1:
+                tx, ty = vals[0], 0.0
+            elif len(vals) == 2:
+                tx, ty = vals
+            else:
+                tx, ty = 0.0, 0.0
+            m_local = np.array([
+                [1, 0, tx],
+                [0, 1, ty],
+                [0, 0, 1]
+            ])
+        elif kind == 'scale':
+            if len(vals) == 1:
+                sx, sy = vals[0], vals[0]
+            elif len(vals) == 2:
+                sx, sy = vals
+            else:
+                sx, sy = 1.0, 1.0
+            m_local = np.array([
+                [sx, 0, 0],
+                [0, sy, 0],
+                [0, 0, 1]
+            ])
+        else:
+            m_local = np.eye(3)
+        mat = m_local @ mat  # composition : la transformation la plus à gauche s'applique en dernier
+    return mat
 
 def apply_matrix_to_point(x, y, mat):
     pt = np.array([x, y, 1])
@@ -1081,11 +1111,14 @@ def normalize_svg_fill(svg_file_path, debug_dir=None):
     return normd_file_path
 
 # Sur-échantillonnage adaptatif pour préserver la douceur des courbes de Bézier
-def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=0.1):
+def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=0.1, px_per_mm=1):
     # Pour les segments de Bézier, adapte le nombre de points à la courbure
     if isinstance(segment, (CubicBezier, QuadraticBezier)):
+        # Valeurs minimales raisonnables en mm (ex: 0.01 mm = 10 microns)
+        min_dist_mm = 0.0001
+        min_dist_px = min_dist_mm * px_per_mm
         # On estime la longueur de la courbe et la courbure max
-        length = segment.length(error=1e-4)
+        length = segment.length(error=min_dist_px)
         # On approxime la courbure max par la distance max entre la courbe et la corde
         ts = np.linspace(0, 1, 10)
         pts = np.array([[pt.real, pt.imag] for pt in [segment.point(t) for t in ts]])
@@ -1094,7 +1127,8 @@ def adaptive_bezier_sampling(segment, nb_pts_smpl, min_pts=10, max_pts=200, tol=
         AB = B - A
         AP = pts - A
         norm_AB = np.linalg.norm(AB)
-        if norm_AB < 1e-12:
+        min_dist_norm_px = 1e-12 * px_per_mm
+        if norm_AB < min_dist_norm_px:
             dists = np.linalg.norm(AP, axis=1)
         else:
             # Produit vectoriel 2D (résultat scalaire)

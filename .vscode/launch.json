@@ -8,7 +8,7 @@
       "program": "${workspaceFolder}/main.py",
       "args": [
         "--svg",
-        "${workspaceFolder}/svgs/le_chat.svg",
+        "${workspaceFolder}/svgs/le_chat_applat.svg",
         "--size",
         "40",
         "--output",
