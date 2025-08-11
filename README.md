@@ -1,102 +1,163 @@
 # SVG_to_STL_stamp_mold
 
-Outil Python pour convertir un fichier SVG en moule 3D imprimable (par exemple pour la fabrication de tampons en silicone).
-
-## Présentation du projet
-
-Ce projet permet de générer automatiquement un moule 3D à partir d'un dessin vectoriel (SVG). Il est particulièrement adapté à la création de tampons, d'emporte-pièces ou de moules personnalisés pour la fabrication artisanale.
-
-Pipeline principal :
-
-1. **Lecture et normalisation du SVG** : nettoyage, héritage des attributs, gestion des transformations, support des paths et ellipses.
-2. **Extraction des contours** : conversion des chemins SVG en polygones, simplification, gestion des sous-chemins.
-3. **Génération du moule** : création de la base, ajout d'une bordure, gravure des motifs.
-4. **Export STL** : sauvegarde du moule final au format STL, prêt à être imprimé en 3D.
+Outil Python pour convertir un SVG en moule 3D imprimable (tampons silicone).
 
 ## Fonctionnalités principales
 
-- Support des fichiers SVG complexes (paths, groupes, ellipses, transformations imbriquées)
-- Simplification automatique des contours (Ramer-Douglas-Peucker)
-- Mise à l'échelle automatique pour respecter une dimension cible
-- Ajout d'une marge et d'une bordure autour du motif
-- Gravure des motifs en creux (profondeur paramétrable)
-- Export des étapes intermédiaires pour le debug (SVG, STL)
-- Mode interactif pour gérer les cas ambigus
+- Support de paths/groupes avec transformations imbriquées, rect/ellipse convertis en paths
+- Mise à l’échelle automatique pour respecter une dimension cible
+- Création de base + bordure (paramètres dans `settings.py`)
+- Gravure en creux des motifs (profondeur paramétrable)
+- Exports de debug (base STL, SVG de résumé par étape et final) via l’API
+
+## Ce qui a changé depuis l’origine
+
+- Normalisation complète des SVG avant conversion:
+  - Conversion des `rect` et `ellipse` en `path` équivalents
+  - Aplatissement des transformations imbriquées (matrix, translate, scale)
+  - Centrage automatique et viewBox propre
+  - Propagation des attributs hérités (fill, stroke)
+- Pipeline de gravure plus robuste:
+  - Groupement outer/inners par inclusion (fill-rule: evenodd)
+  - Loft avec dépouille (angle par défaut 15°), fallback en extrusion simple
+- Base + bordure en anneau générées proprement, export STL de la base disponible
+- Génération de SVG de résumé par étape et final (via l’API), avec statut gravé/non gravé
+- Outils de vérification (rasterisation + IoU) et de recalage affine (ICP)
+- Suite de tests unitaires couvrant les rectangles, ellipses, transform, summary SVG, ICP
 
 ## Dépendances
 
-- Python 3.10+
-- [CadQuery](https://github.com/CadQuery/cadquery)
-- [svgpathtools](https://github.com/mathandy/svgpathtools)
-- numpy, scipy, shapely
+- Python 3.11 (recommandé)
+- cadquery, svgpathtools, numpy, scipy, shapely, matplotlib, cairosvg, pillow
 
-Installer l'environnement recommandé (exemple avec conda) :
+### Installation rapide (Conda, Windows PowerShell)
 
-```bash
-conda env create -f conda_list -n moule_svg
-conda activate moule_svg
+```powershell
+# Créez et activez l’environnement
+conda create -n stl_mold -y -c conda-forge python=3.11
+conda activate stl_mold
+
+# Installez les libs principales via conda-forge (cadquery tire ses dépendances lourdes)
+mamba install -y -c conda-forge cadquery svgpathtools numpy scipy shapely matplotlib pillow cairosvg
+
+# IMPORTANT (Windows): installer le binding Python de nlopt pour CadQuery
+python -m pip install -U pip
+python -m pip install nlopt
 ```
+
+Remarques:
+
+- Sur Windows, même si un paquet `nlopt` conda est présent, l’import Python peut échouer. Le wheel `pip install nlopt` résout le problème d’import (utilisé par `cadquery.occ_impl.sketch_solver`).
+- Les runtimes Visual C++ nécessaires sont généralement installés via conda (vs2015_runtime, vc14_runtime).
 
 ## Structure du projet
 
-- `main.py` : point d'entrée principal (CLI)
-- `utils.py` : foncitons de manipulation SVG et de géométrie
-- `moule_svg_cadquery.py` : cœur du pipeline SVG → STL
-- `settings.py` : paramètres globaux (épaisseurs, marges, etc.)
-- `stls/` : STL générés
-- `svgs/` : SVG sources
-- `debug_*/` : dossiers de debug avec SVG normalisés, STL intermédiaires, etc.
-- `tests/` : tests unitaires
+- `main.py` : point d’entrée principal (CLI)
+- `moule_svg_cadquery.py` : cœur du pipeline SVG → STL (base, bordure, gravure, summary SVG)
+- `utils.py` : fonctions SVG/transformations (flatten, ICP, rasterisation…), regroupements outer/inner
+- `settings.py` : paramètres globaux (épaisseurs, marges, profondeurs, taille max)
+- `svgs/` : exemples de SVG sources
+- `stls/` : exemples de STL générés
+- `tests/` : tests unitaires (unittest)
+- `debug_<nom_svg>/` : répertoire temporaire de debug (SVG normalisé, base STL, résumés SVG, rasters…)
 
-## Utilisation
+## Utilisation (CLI)
 
-### Génération d'un moule
-
-```bash
-python main.py --svg ./<nom_fichier_entrée>.svg --size 40 --output ./stls/nom_fichier_sortie.stl --export-steps
+```powershell
+python .\main.py --svg .\svgs\le_chat.svg --size 40 --output .\stls\moule_chat.stl --keep-debug-files
 ```
 
-**Options principales :**
+Options actuelles:
 
-- `--svg` : chemin du fichier SVG source
-- `--size` : taille maximale du motif (mm)
-- `--output` : chemin du fichier STL de sortie
-- `--export-steps` : export des étapes intermédiaires (debug)
+- `--svg` chemin du SVG source
+- `--size` taille max du motif (mm) [par défaut: `settings.MAX_DIMENSION`]
+- `--output` chemin du STL de sortie
+- `--keep-debug-files` conserve le dossier `debug_<svg>` avec les fichiers intermédiaires
+- `--no-interactive` drapeau prévu pour désactiver les interactions; actuellement non utilisé par le CLI
+
+Notes:
+
+- L’export des étapes intermédiaires (summary SVG par étape) est disponible via l’API (`export_steps=True` dans `generate_cadquery_mold`). Le CLI ne l’expose pas encore.
+- Le STL de base (avant gravure) est exporté dans le répertoire de debug quand `keep-debug-files` est utilisé.
 
 ### Exemple de configuration de débogage VS Code
 
 ```json
 {
-  "name": "Débogueur Python : Fichier chat STL",
+  "name": "Moule depuis SVG (CLI)",
   "type": "debugpy",
   "request": "launch",
-  "program": "${file}",
+  "program": "${workspaceFolder}/main.py",
   "args": [
-    "--svg",
-    "le_chat.svg",
-    "--size",
-    "40",
-    "--output",
-    "moule_chat.stl",
-    "--export-steps"
+    "--svg", "${workspaceFolder}/svgs/le_chat.svg",
+    "--size", "40",
+    "--output", "${workspaceFolder}/stls/moule_chat.stl",
+    "--keep-debug-files"
   ],
   "console": "integratedTerminal"
 }
 ```
 
+## API Python (résumé)
+
+- `generate_cadquery_mold(svg_file, max_dim, ..., export_steps=False, keep_debug_files=False)`
+  - Retourne `(mold_solid, engraved_indices, shape_history)`
+  - Crée `debug_<svg>/`; si `keep_debug_files=False`, ce dossier est supprimé à la fin
+  - Si `export_steps=True`, écrit `step_<k>_summary.svg` à chaque étape + un `summary_<svg>_final.svg`
+
+## Tests
+
+Les tests utilisent `unittest` et couvrent: aplatissement des transforms, conversion rect/ellipse, summary SVG, ICP affine, similarité raster (IoU).
+
+```powershell
+python -m unittest -v
+```
+
+### Exécution des tests dans VS Code
+
+1) Sélectionner l’interpréteur Python
+
+- Command Palette → “Python: Select Interpreter” → choisissez l’interpréteur de l’env `stl_mold` (ex: `C:\Users\<vous>\.conda\envs\stl_mold\python.exe`).
+
+1) Paramètres de découverte unittest (déjà présents dans `.vscode/settings.json`)
+
+```jsonc
+{
+  "python.testing.unittestEnabled": true,
+  "python.testing.unittestArgs": ["-v", "-s", "./tests", "-p", "test_*.py"],
+  "python.testing.pytestEnabled": false
+}
+```
+
+1) Panneau Testing
+
+- Ouvrir Testing → “Refresh” → “Run All Tests”.
+
+Astuce CLI équivalente (depuis la racine du projet, env activé):
+
+```powershell
+python -m unittest discover -v -s .\tests -p test_*.py
+```
+
+### Dépannage “tests non découverts / ImportError”
+
+- Vérifiez que l’interpréteur sélectionné dans VS Code est bien l’env `stl_mold`.
+- Installez le binding Python de `nlopt` si CadQuery se plaint: `python -m pip install nlopt`.
+- Assurez-vous que `numpy`, `cairosvg`, `shapely`, etc. sont bien installés dans le même env.
+- Les warnings `ResourceWarning: unclosed file` émis par CairoSVG sont bénins pour les tests.
+
 ## Aspects avancés et debug
 
-- **Debug visuel** : chaque exécution crée un dossier `debug_<nom_svg>/` avec :
-  - SVG normalisé
-  - STL de la base, étapes de gravure, SVG de résumé
-- **Gestion des erreurs** : le script tente de corriger ou d’ignorer les polygones problématiques (mode interactif ou automatique)
-- **Tests** : des tests unitaires sont disponibles dans `tests/` pour valider la chaîne SVG → STL
+- Debug visuel: `debug_<svg>/` peut contenir le SVG normalisé, le STL de base, les SVG de résumé par étape et final, des rasters PNG.
+- Similarité raster: calcul IoU entre SVG normalisé et résumé final (voir tests).
+- ICP affine: outils pour comparer des polygones ou aligner deux formes (utils.py).
 
 ## Limitations connues
 
-- Certains SVG très complexes ou mal formés peuvent nécessiter un nettoyage manuel
-- Les transformations SVG avancées (hors `matrix()`) sont partiellement supportées
-- Les textes et images raster ne sont pas convertis
+- Transformations supportées dans le parseur: `matrix(...)`, `translate(...)`, `scale(...)` (pas de `rotate(...)` direct)
+- Les arcs sont approximés par des segments lors de certains traitements
+- Textes et images raster ne sont pas pris en charge
+- Certains SVG très complexes/malfichus peuvent nécessiter un nettoyage manuel
 
 ## Auteurs et licence
 

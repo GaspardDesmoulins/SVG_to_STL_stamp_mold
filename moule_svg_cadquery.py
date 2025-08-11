@@ -2,7 +2,6 @@ import os
 import shutil
 import logging
 import math
-import time
 import cadquery as cq
 import numpy as np
 from tqdm import tqdm
