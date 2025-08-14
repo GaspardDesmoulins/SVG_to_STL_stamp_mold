@@ -20,7 +20,7 @@ class TestGenerateSummarySvg(unittest.TestCase):
         # Exécution de la fonction principale pour générer le moule et les fichiers de debug
         mold, engraved_indices, shape_history = generate_cadquery_mold(
             svg_file_path,
-            max_dim=100,
+            max_dim=50,
             export_steps=True,
             keep_debug_files=True,
         )

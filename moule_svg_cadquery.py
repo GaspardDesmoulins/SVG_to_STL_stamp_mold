@@ -8,10 +8,18 @@ from tqdm import tqdm
 from collections import defaultdict
 from svgpathtools import svg2paths2
 import matplotlib.pyplot as plt
+from matplotlib.path import Path as MplPath
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon as ShapelyPolygon
+try:
+    from scipy.ndimage import binary_dilation, binary_erosion
+    _HAS_SCIPY_ND = True
+except Exception:
+    binary_dilation = None
+    binary_erosion = None
+    _HAS_SCIPY_ND = False
 from settings import BASE_THICKNESS, BORDER_HEIGHT, BORDER_THICKNESS, \
     MARGE, ENGRAVE_DEPTH, MAX_DIMENSION
 from utils import normalize_svg_fill, extract_subpaths, to_original_coords, \
@@ -397,10 +405,376 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
         group_counter += 1
     return mold, engraved_indices
 
-def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, border_height=BORDER_HEIGHT,
-                           border_thickness=BORDER_THICKNESS, engrave_depth=ENGRAVE_DEPTH, margin=MARGE,
-                           export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False,
-                           keep_debug_files=False):
+def _rasterize_polygons_to_mask(outer_polys, inner_polys, pixel_size, pad_px=2):
+    """
+    Rasterize a set of outer polygons and inner polygons to a boolean mask using point-in-polygon.
+    - outer_polys / inner_polys: list of list of (x,y)
+    - pixel_size: pixel size in mm (grid resolution)
+    - pad_px: integer padding pixels around bbox
+    Returns: mask (H,W), x_min, y_min, W, H
+    """
+    # Compute bounds across all polygons
+    xs = [x for poly in (outer_polys + inner_polys) for (x, y) in poly]
+    ys = [y for poly in (outer_polys + inner_polys) for (x, y) in poly]
+    if not xs:
+        return None, 0, 0, 0, 0
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    # Determine grid size with padding
+    width_mm = max(max_x - min_x, pixel_size)
+    height_mm = max(max_y - min_y, pixel_size)
+    W = int(math.ceil(width_mm / pixel_size)) + 2 * pad_px
+    H = int(math.ceil(height_mm / pixel_size)) + 2 * pad_px
+    # Grid origin with padding
+    x0 = min_x - pad_px * pixel_size
+    y0 = min_y - pad_px * pixel_size
+    # Build grid of cell centers
+    xs_centers = x0 + (np.arange(W) + 0.5) * pixel_size
+    ys_centers = y0 + (np.arange(H) + 0.5) * pixel_size
+    Xc, Yc = np.meshgrid(xs_centers, ys_centers)
+    pts = np.vstack([Xc.ravel(), Yc.ravel()]).T
+    # Union of outers
+    mask_outer = np.zeros((H, W), dtype=bool)
+    for poly in outer_polys:
+        if len(poly) < 3:
+            continue
+        path = MplPath(poly)
+        inside = path.contains_points(pts)
+        mask_outer |= inside.reshape(H, W)
+    # Union of inners (holes)
+    mask_inner = np.zeros((H, W), dtype=bool)
+    for poly in inner_polys:
+        if len(poly) < 3:
+            continue
+        path = MplPath(poly)
+        inside = path.contains_points(pts)
+        mask_inner |= inside.reshape(H, W)
+    # Final base mask: outer minus inner
+    base_mask = mask_outer & (~mask_inner)
+    return base_mask, x0, y0, W, H
+
+def _rasterize_on_grid(polys, x0, y0, W, H, pixel_size):
+    """
+    Rasterize a list of polygons to a boolean mask on a pre-defined grid.
+    polys: list of list of (x,y)
+    Returns mask (H,W)
+    """
+    if W <= 0 or H <= 0:
+        return None
+    xs_centers = x0 + (np.arange(W) + 0.5) * pixel_size
+    ys_centers = y0 + (np.arange(H) + 0.5) * pixel_size
+    Xc, Yc = np.meshgrid(xs_centers, ys_centers)
+    pts = np.vstack([Xc.ravel(), Yc.ravel()]).T
+    mask = np.zeros((H, W), dtype=bool)
+    for poly in polys:
+        if len(poly) < 3:
+            continue
+        path = MplPath(poly)
+        inside = path.contains_points(pts)
+        mask |= inside.reshape(H, W)
+    return mask
+
+def _mask_runs_per_row(mask):
+    """Itère les runs (segments contigus de True) par ligne et retourne (row, col_deb, col_fin_inclus)."""
+    H, W = mask.shape
+    for r in range(H):
+        row = mask[r]
+        start = None
+        for c in range(W):
+            if row[c] and start is None:
+                start = c
+            elif (not row[c]) and start is not None:
+                yield r, start, c - 1
+                start = None
+        if start is not None:
+            yield r, start, W - 1
+
+def _solid_from_mask(mask, x0, y0, pixel_size, layer_thickness):
+    """
+    Convertit un masque en solide en construisant des rectangles fusionnés verticalement,
+    puis en extrudant toutes les faces en une seule opération (beaucoup plus rapide).
+    Retourne None si le masque est vide.
+    """
+    if mask is None or not mask.any():
+        return None
+    # Regroupe d'abord les runs par ligne
+    H, W = mask.shape
+    runs_per_row = [[] for _ in range(H)]
+    for r, c0, c1 in _mask_runs_per_row(mask):
+        runs_per_row[r].append((c0, c1))
+    # Fusion verticale: on prolonge un run (c0,c1) tant qu'il existe à la ligne suivante
+    active = {}  # (c0,c1) -> (r_start, r_end)
+    rects = []   # (c0, c1, r_start, r_end)
+    for r in range(H):
+        rowset = set(runs_per_row[r])
+        # Finalise les runs actifs qui ne continuent pas
+        finalize = [k for k in active if k not in rowset]
+        for k in finalize:
+            c0, c1 = k
+            r0, r1 = active[k]
+            rects.append((c0, c1, r0, r1))
+            del active[k]
+        # Démarre ou prolonge les runs présents sur la ligne
+        for k in rowset:
+            if k in active:
+                r0, r1 = active[k]
+                active[k] = (r0, r1 + 1)
+            else:
+                active[k] = (r, r)
+    # Finalise les runs restants
+    for k, (r0, r1) in active.items():
+        c0, c1 = k
+        rects.append((c0, c1, r0, r1))
+    if not rects:
+        return None
+    # Construit toutes les faces et extrude en une seule fois
+    faces = []
+    for c0, c1, r0, r1 in rects:
+        x_min = x0 + c0 * pixel_size
+        x_max = x0 + (c1 + 1) * pixel_size
+        y_min = y0 + r0 * pixel_size
+        y_max = y0 + (r1 + 1) * pixel_size
+        pts = [
+            cq.Vector(x_min, y_min, 0),
+            cq.Vector(x_max, y_min, 0),
+            cq.Vector(x_max, y_max, 0),
+            cq.Vector(x_min, y_max, 0),
+            cq.Vector(x_min, y_min, 0),
+        ]
+        try:
+            w = cq.Wire.makePolygon(pts)
+            f = cq.Face.makeFromWires(w)
+            faces.append(f)
+        except Exception:
+            continue
+    if not faces:
+        return None
+    try:
+        wp = cq.Workplane("XY").add(faces).toPending()
+        solid = wp.extrude(layer_thickness, combine=True)
+        return solid.val() if hasattr(solid, 'val') else solid
+    except Exception:
+        # Repli: extrusion face par face et création d'un Compound
+        solids = []
+        for f in faces:
+            try:
+                s = cq.Workplane("XY").add(f).toPending().extrude(layer_thickness)
+                solids.append(s.val() if hasattr(s, 'val') else s)
+            except Exception:
+                pass
+        if not solids:
+            return None
+        try:
+            return cq.Compound.makeCompound(solids)
+        except Exception:
+            return solids[0]
+
+def engrave_polygons_stepped(
+    mold,
+    svg_wires,
+    shape_history,
+    base_thickness,
+    engrave_depth,
+    export_steps,
+    debug_dir,
+    original_svg_path=None,
+    layer_thickness_mm=0.1,
+    pixel_size_mm=0.1,
+    growth_per_layer_px=1,
+):
+    """
+    Gravure alternative par extrusion étagée et raster, avec croissance/rétraction par couche.
+
+    Pour chaque groupe de wires [outer, inner1, ...] :
+      - On rasterise les contours sur une grille (pixel_size_mm).
+      - À chaque couche, on dilate le masque outer et on érode les masques inner (croissance par growth_per_layer_px).
+      - On extrude en solide le masque outer ET, séparément, le masque inner; puis on retire les inner du outer
+        via une coupe booléenne (outer_slab.cut(inner_slab)).
+      - Le solide résultant de la couche est ensuite retiré du moule à la hauteur Z de la couche.
+
+    Par défaut: 0.1 mm par couche, pixel de 0.1 mm, croissance de 1 pixel/couche (~45° parois en escaliers).
+
+    Retourne: (nouveau_moule, indices_gravés)
+    """
+    engraved_indices = []
+    grouped_wires = group_wires_by_inclusion(svg_wires, shape_history)
+    wire_to_shape = shape_history.get('wire_to_shape', {})
+
+    # Détermination du nombre de couches (évite épaisseur nulle ou négative)
+    if layer_thickness_mm <= 0:
+        layer_thickness_mm = 0.1
+    n_layers = max(1, int(math.ceil(engrave_depth / layer_thickness_mm)))
+    logger.info(f"Gravure étagée: {n_layers} couches de {layer_thickness_mm} mm chacune pour une profondeur totale de {engrave_depth} mm.")
+    # Vérification de la taille de pixel (grille) positive
+    pixel_size = max(1e-3, float(pixel_size_mm))
+    growth_px = max(0, int(growth_per_layer_px))
+
+    group_counter = 0
+    # Boucle sur les groupes (un groupe = 1 outer + 0..n inners)
+    for group_idx, wire_group in grouped_wires:
+        try:
+            logger.info(f"--- Gravure étagée (raster) groupe {group_idx} : {len(wire_group)} wires ---")
+            # Préparation des polygones 2D (points XY) à partir des wires CadQuery
+            outer_wire = wire_group[0]
+            inner_wires = wire_group[1:] if len(wire_group) > 1 else []
+            outer_poly = [(v.X, v.Y) for v in outer_wire.Vertices()]
+            inner_polys = [[(v.X, v.Y) for v in w.Vertices()] for w in inner_wires]
+            # Ajout d'un padding pour anticiper la croissance au fil des couches
+            pad_px = 2 + growth_px * n_layers
+            base_mask, x0, y0, W, H = _rasterize_polygons_to_mask([outer_poly], inner_polys, pixel_size, pad_px=pad_px)
+            # Si rien à rasteriser, on marque le groupe comme non gravé et on passe au suivant
+            if base_mask is None or not base_mask.any():
+                logger.warning(f"Groupe {group_counter}: masque vide après rasterisation, ignoré.")
+                mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
+                group_counter += 1
+                continue
+
+            # Pré-calcul des masques de base, sur UNE MÊME GRILLE (important pour des tailles identiques)
+            # outer_base: union des contours extérieurs; inner_base: union des trous
+            outer_base = _rasterize_on_grid([outer_poly], x0, y0, W, H, pixel_size)
+            inner_base = _rasterize_on_grid(inner_polys, x0, y0, W, H, pixel_size) if inner_polys else np.zeros_like(base_mask, dtype=bool)
+
+            # Élément structurant 3x3 (connectivité 8) pour dilatation/érosion
+            structure = np.ones((3, 3), dtype=bool)
+
+            group_success = False
+            group_slabs = []  # Accumule les solides de chaque couche pour un cut unique par groupe
+            # Prépare des masques cumulés pour croissance/érosion incrémentales (plus efficace)
+            mask_outer_i = outer_base.copy()
+            mask_inner_i = inner_base.copy()
+            # Boucle sur les couches de gravure
+            for li in tqdm(range(n_layers), desc=f"Couches (groupe {group_counter})"):
+                # Épaisseur effective de la couche (on borne la dernière pour atteindre exactement la profondeur totale)
+                remaining = engrave_depth - li * layer_thickness_mm
+                if remaining <= 0:
+                    break  # Arrêt si on a atteint la profondeur cible
+                layer_thickness_i = min(layer_thickness_mm, remaining)
+                # Croissance/érosion incrémentale: applique growth_px par couche à partir de l'état précédent
+                if growth_px > 0 and li > 0:
+                    if _HAS_SCIPY_ND:
+                        if mask_outer_i.any():
+                            mask_outer_i = binary_dilation(mask_outer_i, structure=structure, iterations=growth_px)
+                        if mask_inner_i.any():
+                            mask_inner_i = binary_erosion(mask_inner_i, structure=structure, iterations=growth_px)
+                    else:
+                        logger.warning("Scipy.ndimage non disponible, croissance/érosion manuelle appliquée.")
+                        for _ in range(growth_px):
+                            if mask_outer_i.any():
+                                n = np.pad(mask_outer_i, 1, mode='constant', constant_values=False)
+                                mask_outer_i = (
+                                    n[:-2,1:-1] | n[2:,1:-1] | n[1:-1,:-2] | n[1:-1,2:] |
+                                    n[:-2,:-2] | n[:-2,2:] | n[2:,:-2] | n[2:,2:] | mask_outer_i
+                                )
+                            if mask_inner_i.any():
+                                n = np.pad(mask_inner_i, 1, mode='constant', constant_values=False)
+                                mask_inner_i = (
+                                    n[:-2,1:-1] & n[2:,1:-1] & n[1:-1,:-2] & n[1:-1,2:] &
+                                    n[:-2,:-2] & n[:-2,2:] & n[2:,:-2] & n[2:,2:] & mask_inner_i
+                                )
+
+                # Construction des solides par couche:
+                #  - outer_slab: extrusion du masque outer
+                #  - inner_slab: extrusion du masque inner (si présent)
+                if not mask_outer_i.any():
+                    # Rien à extruder pour cette couche
+                    logger.warning(f"Groupe {group_counter}, couche {li}: masque outer vide après croissance/érosion, ignoré.") 
+                    continue
+                outer_slab = _solid_from_mask(mask_outer_i, x0, y0, pixel_size, layer_thickness_i)
+                inner_slab = _solid_from_mask(mask_inner_i, x0, y0, pixel_size, layer_thickness_i) if mask_inner_i.any() else None
+                if outer_slab is None:
+                    # Échec de construction du solide outer
+                    logger.warning(f"Groupe {group_counter}, couche {li}: échec de construction du solide outer.")
+                    continue
+                # Positionnement en Z: au bas de la couche
+                z_bottom = base_thickness - (n_layers-li-1) * layer_thickness_mm
+                outer_slab = outer_slab.translate((0, 0, z_bottom))
+                if inner_slab is not None:
+                    inner_slab = inner_slab.translate((0, 0, z_bottom))
+                # Soustraction des inner au outer (exigence: extruder puis retirer les inner)
+                slab_effective = outer_slab
+                if inner_slab is not None:
+                    try:
+                        slab_effective = slab_effective.cut(inner_slab)
+                    except Exception as e:
+                        # Si la coupe échoue, on ignore les inner pour cette couche (fallback minimal)
+                        logger.warning(f"Coupe outer-inner échouée (couche {li}, groupe {group_counter}) : {e}")
+
+                # Accumule le solide de la couche pour un cut unique à la fin du groupe
+                group_slabs.append(slab_effective)
+                group_success = True
+
+            # Coupe finale du groupe : séquentielle pour préserver visuellement les marches
+            if group_slabs:
+                # Optionnel: export du volume des couches pour inspection
+                if export_steps:
+                    try:
+                        shapes = []
+                        for s in group_slabs:
+                            shapes.append(s.val() if hasattr(s, 'val') and callable(getattr(s, 'val')) else s)
+                        comp = cq.Compound.makeCompound(shapes) if len(shapes) > 1 else shapes[0]
+                        cq.exporters.export(comp, os.path.join(debug_dir, f"group_{group_counter}_slabs.stl"))
+                    except Exception:
+                        pass
+                try:
+                    for slab in group_slabs:
+                        mold = mold.cut(slab)
+                except Exception as ce:
+                    logger.warning(f"Erreur coupe séquentielle du groupe {group_counter} : {ce}")
+                    group_success = False
+
+            if export_steps and group_success:
+                step_stl_path = os.path.join(debug_dir, f"step_{group_counter}.stl")
+                try:
+                    cq.exporters.export(mold, step_stl_path)
+                    logger.info(f"Export STL intermédiaire (raster) : {step_stl_path}")
+                except Exception as e:
+                    logger.warning(f"Export STL échoué pour le groupe {group_counter} : {e}")
+
+            if group_success:
+                engraved_indices.append(group_counter)
+                mark_wires_engraved(wire_group, True, svg_wires, shape_history, group_counter)
+            else:
+                mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
+
+        except Exception as e:
+            logger.error(f"Erreur lors de la gravure étagée du groupe {group_counter}: {e}")
+        finally:
+            # SVG de résumé par groupe (si dispo)
+            if original_svg_path is not None:
+                wire_to_shape = shape_history.get('wire_to_shape', {})
+                current_shape_keys = []
+                # Recherche des clés de shapes associées à ce groupe
+                for w in wire_group:
+                    global_wire_index = get_global_wire_index(w, svg_wires)
+                    if global_wire_index is not None and global_wire_index in wire_to_shape:
+                        current_shape_keys.append(wire_to_shape[global_wire_index])
+                if current_shape_keys:
+                    summary_svg_path = os.path.join(debug_dir, f"step_{group_idx}_summary.svg")
+                    try:
+                        generate_summary_svg(current_shape_keys, summary_svg_path, shape_history=shape_history)
+                    except Exception as e:
+                        logger.warning(f"Echec génération SVG résumé (groupe {group_idx}) : {e}")
+            group_counter += 1
+
+    return mold, engraved_indices
+
+def generate_cadquery_mold(
+    svg_file,
+    max_dim,
+    base_thickness=BASE_THICKNESS,
+    border_height=BORDER_HEIGHT,
+    border_thickness=BORDER_THICKNESS,
+    engrave_depth=ENGRAVE_DEPTH,
+    margin=MARGE,
+    export_base_stl=True,
+    base_stl_name="moule_base.stl",
+    export_steps=False,
+    keep_debug_files=False,
+    engraving_mode="classic",  # "classic" (loft/extrude) or "stepped"
+    layer_thickness_mm=0.1,
+    pixel_size_mm=0.1,
+    growth_per_layer_px=1,
+):
     # Détermination du nom du dossier de debug à partir du nom du fichier SVG
     svg_basename = os.path.splitext(os.path.basename(svg_file))[0]
     debug_dir = f"debug_{svg_basename}"
@@ -425,10 +799,25 @@ def generate_cadquery_mold(svg_file, max_dim, base_thickness=BASE_THICKNESS, bor
     # Récupération de la liste des shape_keys pour le résumé SVG
     shape_keys = [k for k in shape_history if isinstance(k, tuple)]
 
-    mold, engraved_indices = engrave_polygons(
-        mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
-        original_svg_path=svg_file
-    )
+    if engraving_mode == "stepped":
+        mold, engraved_indices = engrave_polygons_stepped(
+            mold,
+            svg_wires,
+            shape_history,
+            base_thickness,
+            engrave_depth,
+            export_steps,
+            debug_dir,
+            original_svg_path=svg_file,
+            layer_thickness_mm=layer_thickness_mm,
+            pixel_size_mm=pixel_size_mm,
+            growth_per_layer_px=growth_per_layer_px,
+        )
+    else:
+        mold, engraved_indices = engrave_polygons(
+            mold, svg_wires, shape_history, base_thickness, engrave_depth, export_steps, debug_dir,
+            original_svg_path=svg_file
+        )
 
     # Génération d'un SVG de résumé global de toutes les formes (gravées ou non)
     all_shape_keys = [k for k in shape_history if isinstance(k, tuple)]

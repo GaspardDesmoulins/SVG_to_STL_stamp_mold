@@ -10,6 +10,7 @@ if __name__ == "__main__":
     parser.add_argument("--svg", help="Chemin du fichier SVG")
     parser.add_argument("--size", type=float, default=MAX_DIMENSION, help="Taille max du moule (mm)")
     parser.add_argument("--output", default="moule_cadquery.stl", help="Fichier de sortie STL")
+    parser.add_argument("--stepped", action="store_true", help="Active le mode étagé.", default=False)
     parser.add_argument("--no-interactive", action="store_true", help="Désactive le mode interactif")
     parser.add_argument("--keep-debug-files", action="store_true", help="Conserver le répertoire de debug et les fichiers intermédiaires")
     args = parser.parse_args()
@@ -31,6 +32,7 @@ if __name__ == "__main__":
             engrave_depth=ENGRAVE_DEPTH,
             margin=MARGE,
             export_base_stl=True,
+            engraving_mode="stepped" if args.stepped else "classic",
             base_stl_name="moule_base.stl",
             keep_debug_files=args.keep_debug_files if hasattr(args, 'keep_debug_files') else False
         )

@@ -13,7 +13,8 @@
         "40",
         "--output",
         "${workspaceFolder}/stls/moule_chat.stl",
-        "--keep-debug-files"
+        "--keep-debug-files",
+        "--stepped"
       ],
       "console": "integratedTerminal"
     },

@@ -8,7 +8,13 @@ Outil Python pour convertir un SVG en moule 3D imprimable (tampons silicone).
 - Mise à l’échelle automatique pour respecter une dimension cible
 - Création de base + bordure (paramètres dans `settings.py`)
 - Gravure en creux des motifs (profondeur paramétrable)
-- Exports de debug (base STL, SVG de résumé par étape et final) via l’API
+- Deux modes de gravure:
+  - Classique: loft avec dépouille puis extrusion si nécessaire
+  - Étagé (raster): par couches en « escaliers » pour une robustesse accrue sur des formes complexes
+- Exports de debug:
+  - STL de base du moule
+  - SVG de résumé par étape automatiquement générés, et un résumé final
+  - STL intermédiaires par groupe (si activé via API)
 
 ## Ce qui a changé depuis l’origine
 
@@ -20,15 +26,19 @@ Outil Python pour convertir un SVG en moule 3D imprimable (tampons silicone).
 - Pipeline de gravure plus robuste:
   - Groupement outer/inners par inclusion (fill-rule: evenodd)
   - Loft avec dépouille (angle par défaut 15°), fallback en extrusion simple
+- Nouveau mode « gravure étagée (raster) »:
+  - Rasterisation des contours, croissance/érosion par couche, extrusion de dalles (0,1 mm par défaut)
+  - Paramètres API: `layer_thickness_mm`, `pixel_size_mm`, `growth_per_layer_px`
+  - Exporte un STL des dalles de chaque groupe si `export_steps=True`
 - Base + bordure en anneau générées proprement, export STL de la base disponible
-- Génération de SVG de résumé par étape et final (via l’API), avec statut gravé/non gravé
+- Génération automatique de SVG de résumé par étape et final, avec statut gravé/non gravé
 - Outils de vérification (rasterisation + IoU) et de recalage affine (ICP)
 - Suite de tests unitaires couvrant les rectangles, ellipses, transform, summary SVG, ICP
 
 ## Dépendances
 
 - Python 3.11 (recommandé)
-- cadquery, svgpathtools, numpy, scipy, shapely, matplotlib, cairosvg, pillow
+- cadquery, svgpathtools, numpy, scipy, shapely, matplotlib, cairosvg, pillow, tqdm
 
 ### Installation rapide (Conda, Windows PowerShell)
 
@@ -38,7 +48,7 @@ conda create -n stl_mold -y -c conda-forge python=3.11
 conda activate stl_mold
 
 # Installez les libs principales via conda-forge (cadquery tire ses dépendances lourdes)
-mamba install -y -c conda-forge cadquery svgpathtools numpy scipy shapely matplotlib pillow cairosvg
+mamba install -y -c conda-forge cadquery svgpathtools numpy scipy shapely matplotlib pillow cairosvg tqdm
 
 # IMPORTANT (Windows): installer le binding Python de nlopt pour CadQuery
 python -m pip install -U pip
@@ -64,7 +74,7 @@ Remarques:
 ## Utilisation (CLI)
 
 ```powershell
-python .\main.py --svg .\svgs\le_chat.svg --size 40 --output .\stls\moule_chat.stl --keep-debug-files
+python .\main.py --svg .\svgs\le_chat.svg --size 40 --output .\stls\moule_chat.stl --keep-debug-files --stepped
 ```
 
 Options actuelles:
@@ -73,12 +83,14 @@ Options actuelles:
 - `--size` taille max du motif (mm) [par défaut: `settings.MAX_DIMENSION`]
 - `--output` chemin du STL de sortie
 - `--keep-debug-files` conserve le dossier `debug_<svg>` avec les fichiers intermédiaires
+- `--stepped` active la gravure étagée (raster) au lieu du mode classique (loft/extrusion)
 - `--no-interactive` drapeau prévu pour désactiver les interactions; actuellement non utilisé par le CLI
 
 Notes:
 
-- L’export des étapes intermédiaires (summary SVG par étape) est disponible via l’API (`export_steps=True` dans `generate_cadquery_mold`). Le CLI ne l’expose pas encore.
-- Le STL de base (avant gravure) est exporté dans le répertoire de debug quand `keep-debug-files` est utilisé.
+- Les SVG de résumé par étape sont générés automatiquement dans `debug_<svg>/` pendant la gravure; le résumé final est également écrit. Ces fichiers de debug ne sont conservés que si `--keep-debug-files` est fourni.
+- Les STL intermédiaires (par groupe et dalles) ne sont exportés que si `export_steps=True` (réglable via l’API, pas exposé en CLI pour l’instant).
+- Le STL de base (avant gravure) est toujours exporté dans le répertoire de debug, mais il n’est conservé que si `--keep-debug-files` est fourni.
 
 ### Exemple de configuration de débogage VS Code
 
@@ -100,10 +112,15 @@ Notes:
 
 ## API Python (résumé)
 
-- `generate_cadquery_mold(svg_file, max_dim, ..., export_steps=False, keep_debug_files=False)`
+- `generate_cadquery_mold(svg_file, max_dim, base_thickness=..., border_height=..., border_thickness=..., engrave_depth=..., margin=..., export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False, keep_debug_files=False, engraving_mode="classic"|"stepped", layer_thickness_mm=0.1, pixel_size_mm=0.1, growth_per_layer_px=1)`
   - Retourne `(mold_solid, engraved_indices, shape_history)`
   - Crée `debug_<svg>/`; si `keep_debug_files=False`, ce dossier est supprimé à la fin
-  - Si `export_steps=True`, écrit `step_<k>_summary.svg` à chaque étape + un `summary_<svg>_final.svg`
+  - Génère `step_<k>_summary.svg` à chaque étape + un `summary_<svg>_final.svg`
+  - Si `export_steps=True`:
+    - Exporte aussi les STL intermédiaires: `step_<k>.stl` et `group_<k>_slabs.stl` (en mode étagé)
+  - `engraving_mode`:
+    - `classic`: loft avec dépouille (15° par défaut), fallback extrusion
+    - `stepped`: gravure par couches (0,1 mm par défaut), grille raster `pixel_size_mm` et croissance par couche `growth_per_layer_px`
 
 ## Tests
 
@@ -151,6 +168,7 @@ python -m unittest discover -v -s .\tests -p test_*.py
 - Debug visuel: `debug_<svg>/` peut contenir le SVG normalisé, le STL de base, les SVG de résumé par étape et final, des rasters PNG.
 - Similarité raster: calcul IoU entre SVG normalisé et résumé final (voir tests).
 - ICP affine: outils pour comparer des polygones ou aligner deux formes (utils.py).
+- Mode étagé: utilise `scipy.ndimage` pour la dilatation/érosion si disponible; sinon, un fallback pur NumPy est utilisé (plus lent).
 
 ## Limitations connues
 
