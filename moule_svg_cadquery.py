@@ -782,7 +782,8 @@ def generate_cadquery_mold(
 
     logger.info(f"Normalisation du SVG : {svg_file}")
     # On force l'utilisation du viewBox d'origine pour garantir la compatibilité avec le résumé SVG
-    normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir)
+    # Inversion X pendant la normalisation pour que la base soit calculée depuis les motifs inversés
+    normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir, invert_x=True, invert_y=False)
 
     # Récupération des wires et de l'historique des shapes
     svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)

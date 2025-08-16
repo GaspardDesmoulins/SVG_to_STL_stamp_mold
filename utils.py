@@ -1046,7 +1046,7 @@ def to_original_coords(pt, px_per_mm, svg_min_x, svg_min_y):
         return pt
 
 
-def normalize_svg_fill(svg_file_path, debug_dir=None, shape_history=None):
+def normalize_svg_fill(svg_file_path, debug_dir=None, shape_history=None, invert_x=True, invert_y=False):
     """
     Normalise un SVG :
     - Convertit les <rect> et <ellipse> en <path>
@@ -1073,6 +1073,11 @@ def normalize_svg_fill(svg_file_path, debug_dir=None, shape_history=None):
     if shape_history is not None:
         shape_history['viewBox'] = f"0 0 {width} {height}"
 
+    # Inversion optionnelle sur X et/ou Y AVANT le regroupement, pour que toute la chaîne (base incluse)
+    # soit calculée à partir des motifs inversés
+    if invert_x or invert_y:
+        _invert_svg_axes_inplace(root, width, height, invert_x=invert_x, invert_y=invert_y)
+
 
     _set_svg_root_attributes(root)
     _remove_namespaces_and_metadata(root)
@@ -1084,6 +1089,36 @@ def normalize_svg_fill(svg_file_path, debug_dir=None, shape_history=None):
 
     normd_file_path = write_svg_to_file(normalized_svg, svg_file_path, debug_dir=debug_dir)
     return normd_file_path
+
+def _invert_svg_axes_inplace(root, width, height, invert_x=True, invert_y=True):
+    """
+    Applique en place une inversion horizontale (X) et/ou verticale (Y) aux paths du SVG, dans le repère
+    viewBox=[0,width]x[0,height]. L'inversion est effectuée via une matrice affine.
+    - invert_x: miroir gauche-droite (x' = width - x)
+    - invert_y: miroir haut-bas (y' = height - y)
+    """
+    if not (invert_x or invert_y):
+        return
+    # Matrices affines 3x3 homogènes
+    m = np.eye(3)
+    if invert_x:
+        mx = np.array([[ -1.0, 0.0,  float(width) ],
+                       [  0.0, 1.0,  0.0          ],
+                       [  0.0, 0.0,  1.0          ]])
+        m = mx @ m
+    if invert_y:
+        my = np.array([[ 1.0,  0.0,  0.0           ],
+                       [ 0.0, -1.0,  float(height) ],
+                       [ 0.0,  0.0,  1.0           ]])
+        m = my @ m
+    # Applique la matrice à tous les d des paths
+    for elem in root.iter():
+        if strip_namespace(elem.tag) == 'path' and 'd' in elem.attrib:
+            try:
+                elem.attrib['d'] = transform_path_d(elem.attrib['d'], m)
+            except Exception:
+                # Si un path pose problème, on l'ignore pour ne pas bloquer toute la normalisation
+                continue
 
 def _get_svg_content_bbox(root):
     """
