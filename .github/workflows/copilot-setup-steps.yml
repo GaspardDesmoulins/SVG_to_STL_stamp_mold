@@ -1,0 +1,28 @@
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - environment.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - environment.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: conda-incubator/setup-miniconda@v3.2.0
+        with:
+          activate-environment: svg-to-stl-stamp-mold
+          environment-file: environment.yml
+          miniforge-version: latest
+      - name: Run test suite
+        shell: bash -el {0}
+        run: python -m unittest discover -v -s tests -p "test_*.py"

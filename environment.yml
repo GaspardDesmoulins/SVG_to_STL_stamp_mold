@@ -1,0 +1,16 @@
+name: svg-to-stl-stamp-mold
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - cadquery=2.6.0
+  - cairosvg
+  - matplotlib
+  - nlopt
+  - numpy
+  - pillow
+  - scipy
+  - shapely
+  - svgpathtools
+  - tqdm
