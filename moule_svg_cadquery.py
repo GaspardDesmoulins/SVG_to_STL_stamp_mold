@@ -7,7 +7,6 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 from svgpathtools import svg2paths2
-import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -34,6 +33,19 @@ if not logger.hasHandlers():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+
+class MoldGenerationError(RuntimeError):
+    """Erreur de génération accompagnée de l'étape et du groupe SVG concernés."""
+
+    def __init__(self, stage, message, group_idx=None):
+        context = f"{stage}"
+        if group_idx is not None:
+            context += f", groupe {group_idx}"
+        super().__init__(f"{context}: {message}")
+        self.stage = stage
+        self.group_idx = group_idx
+
 
 def svg_to_cadquery_wires(svg_file, max_dimension=MAX_DIMENSION, rdp=False, force_all_contours=False):
     """
@@ -388,7 +400,8 @@ def engrave_polygons(mold, svg_wires, shape_history, base_thickness, engrave_dep
             else:
                 mark_wires_engraved(wire_group, True, svg_wires, shape_history, group_counter)
         except Exception as e:
-            logger.error(f"Erreur lors de la gravure du groupe {group_counter}: {e}")
+            mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
+            raise MoldGenerationError("gravure classique", str(e), group_counter) from e
 
         # Génération du SVG de résumé après chaque étape de gravure
         if original_svg_path is not None:
@@ -624,10 +637,9 @@ def engrave_polygons_stepped(
             base_mask, x0, y0, W, H = _rasterize_polygons_to_mask([outer_poly], inner_polys, pixel_size, pad_px=pad_px)
             # Si rien à rasteriser, on marque le groupe comme non gravé et on passe au suivant
             if base_mask is None or not base_mask.any():
-                logger.warning(f"Groupe {group_counter}: masque vide après rasterisation, ignoré.")
+                logger.warning(f"Groupe {group_counter}: masque vide après rasterisation.")
                 mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
-                group_counter += 1
-                continue
+                raise MoldGenerationError("gravure voxelisée", "masque vide après rasterisation", group_counter)
 
             # Pré-calcul des masques de base, sur UNE MÊME GRILLE (important pour des tailles identiques)
             # outer_base: union des contours extérieurs; inner_base: union des trous
@@ -682,9 +694,11 @@ def engrave_polygons_stepped(
                 outer_slab = _solid_from_mask(mask_outer_i, x0, y0, pixel_size, layer_thickness_i)
                 inner_slab = _solid_from_mask(mask_inner_i, x0, y0, pixel_size, layer_thickness_i) if mask_inner_i.any() else None
                 if outer_slab is None:
-                    # Échec de construction du solide outer
-                    logger.warning(f"Groupe {group_counter}, couche {li}: échec de construction du solide outer.")
-                    continue
+                    raise MoldGenerationError(
+                        "gravure voxelisée",
+                        f"échec de construction du solide à la couche {li}",
+                        group_counter,
+                    )
                 # Positionnement en Z: au bas de la couche
                 z_bottom = base_thickness - (n_layers-li-1) * layer_thickness_mm
                 outer_slab = outer_slab.translate((0, 0, z_bottom))
@@ -696,8 +710,11 @@ def engrave_polygons_stepped(
                     try:
                         slab_effective = slab_effective.cut(inner_slab)
                     except Exception as e:
-                        # Si la coupe échoue, on ignore les inner pour cette couche (fallback minimal)
-                        logger.warning(f"Coupe outer-inner échouée (couche {li}, groupe {group_counter}) : {e}")
+                        raise MoldGenerationError(
+                            "gravure voxelisée",
+                            f"échec de la coupe des trous à la couche {li}",
+                            group_counter,
+                        ) from e
 
                 # Accumule le solide de la couche pour un cut unique à la fin du groupe
                 group_slabs.append(slab_effective)
@@ -719,8 +736,11 @@ def engrave_polygons_stepped(
                     for slab in group_slabs:
                         mold = mold.cut(slab)
                 except Exception as ce:
-                    logger.warning(f"Erreur coupe séquentielle du groupe {group_counter} : {ce}")
-                    group_success = False
+                    raise MoldGenerationError(
+                        "gravure voxelisée",
+                        "échec de la coupe des couches dans le moule",
+                        group_counter,
+                    ) from ce
 
             if export_steps and group_success:
                 step_stl_path = os.path.join(debug_dir, f"step_{group_counter}.stl")
@@ -736,8 +756,12 @@ def engrave_polygons_stepped(
             else:
                 mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
 
+        except MoldGenerationError:
+            mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
+            raise
         except Exception as e:
-            logger.error(f"Erreur lors de la gravure étagée du groupe {group_counter}: {e}")
+            mark_wires_engraved(wire_group, False, svg_wires, shape_history, group_counter)
+            raise MoldGenerationError("gravure voxelisée", str(e), group_counter) from e
         finally:
             # SVG de résumé par groupe (si dispo)
             if original_svg_path is not None:
@@ -770,11 +794,20 @@ def generate_cadquery_mold(
     base_stl_name="moule_base.stl",
     export_steps=False,
     keep_debug_files=False,
-    engraving_mode="classic",  # "classic" (loft/extrude) or "stepped"
+    engraving_mode="stepped",  # "classic" (loft/extrude) or "stepped"
     layer_thickness_mm=0.1,
     pixel_size_mm=0.1,
     growth_per_layer_px=1,
 ):
+    if max_dim <= 2 * margin:
+        raise ValueError("max_dim doit être supérieur à deux fois la marge.")
+    if base_thickness <= 0 or engrave_depth <= 0:
+        raise ValueError("base_thickness et engrave_depth doivent être strictement positifs.")
+    if engraving_mode not in {"classic", "stepped"}:
+        raise ValueError("engraving_mode doit être 'classic' ou 'stepped'.")
+    if engraving_mode == "stepped" and (layer_thickness_mm <= 0 or pixel_size_mm <= 0 or growth_per_layer_px < 0):
+        raise ValueError("Les paramètres de gravure voxelisée sont invalides.")
+
     # Détermination du nom du dossier de debug à partir du nom du fichier SVG
     svg_basename = os.path.splitext(os.path.basename(svg_file))[0]
     debug_dir = f"debug_{svg_basename}"
@@ -783,19 +816,29 @@ def generate_cadquery_mold(
     logger.info(f"Normalisation du SVG : {svg_file}")
     # On force l'utilisation du viewBox d'origine pour garantir la compatibilité avec le résumé SVG
     # Inversion X pendant la normalisation pour que la base soit calculée depuis les motifs inversés
-    normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir, invert_x=True, invert_y=False)
+    try:
+        normalized_svg_file = normalize_svg_fill(svg_file, debug_dir=debug_dir, invert_x=True, invert_y=False)
+    except Exception as error:
+        raise MoldGenerationError("normalisation SVG", str(error)) from error
 
     # Récupération des wires et de l'historique des shapes
-    svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
+    try:
+        svg_wires, shape_history = svg_to_cadquery_wires(normalized_svg_file, max_dim)
+    except Exception as error:
+        raise MoldGenerationError("conversion SVG", str(error)) from error
 
     # Initialisation du statut 'engraved' pour chaque shape
     for k in shape_history:
         if isinstance(k, tuple):
             shape_history[k]['engraved'] = False
 
-    mold = create_mold_base(
-        svg_wires, margin, base_thickness, border_height, border_thickness, debug_dir, base_stl_name, export_base_stl=export_base_stl
-    )
+    try:
+        mold = create_mold_base(
+            svg_wires, margin, base_thickness, border_height, border_thickness, debug_dir, base_stl_name,
+            export_base_stl=export_base_stl,
+        )
+    except Exception as error:
+        raise MoldGenerationError("construction de la base", str(error)) from error
 
     # Récupération de la liste des shape_keys pour le résumé SVG
     shape_keys = [k for k in shape_history if isinstance(k, tuple)]
@@ -1145,34 +1188,21 @@ def loft_with_draft(wire_group, draft_angle_deg, depth, px_per_mm=1, debug_plot=
         for wire_index, wire in enumerate(wire_group):
             centroid_direction = 1 if wire_index == 0 else -1
             scaled_wire = get_scaled_wire_from_wire(wire, offset_initial, centroid_direction)
-            # Affichage interactif du wire original et du wire décalé
-            fig, ax = plt.subplots()
-            # Wire original
-            wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
-            xs, ys = zip(*wire_points)
-            if centroid_direction == 1:
-                ax.plot(xs, ys, color='black', linewidth=2, label='Wire original (outer)')
-            else:
-                ax.plot(xs, ys, color='black', linestyle='--', linewidth=1, label='Wire original (inner)')
-            # Wire décalé
-            if scaled_wire is not None:
-                scaled_points = [(v.X, v.Y) for v in scaled_wire.Vertices()]
-                xs2, ys2 = zip(*scaled_points)
-                if centroid_direction == 1:
-                    ax.plot(xs2, ys2, color='blue', linewidth=2, label='Wire outer décalé')
-                else:
-                    ax.plot(xs2, ys2, color='brown', linewidth=2, label='Wire inner décalé')
-            ax.set_aspect('equal')
-            ax.set_title(f"Wire {wire_index} : original et décalé")
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            ax.legend(by_label.values(), by_label.keys())
-            if debug_plot:
-                plt.show()
             # Si l'utilisateur a choisi d'ignorer ce wire, on saute la création
             if scaled_wire is None:
                 logger.info(f"Wire {wire_index} ignoré, aucune gravure ne sera réalisée pour ce trou.")
                 continue
+            if debug_plot:
+                from matplotlib import pyplot as plt
+
+                wire_points = [(vertex.X, vertex.Y) for vertex in wire.Vertices()]
+                scaled_points = [(v.X, v.Y) for v in scaled_wire.Vertices()]
+                fig, ax = plt.subplots()
+                ax.plot(*zip(*wire_points), color='black', linewidth=2, label='Wire original')
+                ax.plot(*zip(*scaled_points), color='blue', linewidth=2, label='Wire décalé')
+                ax.set_aspect('equal')
+                ax.legend()
+                plt.show()
             # Création des faces (top = wire décalé, bottom = wire original)
             try:
                 face_top = cq.Face.makeFromWires(scaled_wire)

@@ -9,8 +9,8 @@ Outil Python pour convertir un SVG en moule 3D imprimable (tampons silicone).
 - Création de base + bordure (paramètres dans `settings.py`)
 - Gravure en creux des motifs (profondeur paramétrable)
 - Deux modes de gravure:
-  - Classique: loft avec dépouille puis extrusion si nécessaire
-  - Étagé (raster): par couches en « escaliers » pour une robustesse accrue sur des formes complexes
+  - Étagé (voxelisé): par couches en « escaliers », mode par défaut et recommandé
+  - Classique: loft avec dépouille puis extrusion, disponible pour les cas simples
 - Exports de debug:
   - STL de base du moule
   - SVG de résumé par étape automatiquement générés, et un résumé final
@@ -74,23 +74,27 @@ Remarques:
 ## Utilisation (CLI)
 
 ```powershell
-python .\main.py --svg .\svgs\le_chat.svg --size 40 --output .\stls\moule_chat.stl --keep-debug-files --stepped
+python .\main.py --svg .\svgs\le_chat.svg --size 40 --output .\stls\moule_chat.stl --keep-debug-files
 ```
 
 Options actuelles:
 
-- `--svg` chemin du SVG source
+- `--svg` chemin obligatoire du SVG source existant
 - `--size` taille max du motif (mm) [par défaut: `settings.MAX_DIMENSION`]
 - `--output` chemin du STL de sortie
 - `--keep-debug-files` conserve le dossier `debug_<svg>` avec les fichiers intermédiaires
-- `--stepped` active la gravure étagée (raster) au lieu du mode classique (loft/extrusion)
-- `--no-interactive` drapeau prévu pour désactiver les interactions; actuellement non utilisé par le CLI
+- `--stepped` sélectionne explicitement la gravure voxelisée par couches (mode par défaut)
+- `--classic` sélectionne le loft avec dépouille ; cette option est moins robuste sur les formes complexes
+- `--layer-thickness`, `--pixel-size`, `--growth-per-layer` règlent respectivement l'épaisseur de couche (mm), la résolution (mm) et la croissance de contour par couche (pixels)
+- `--export-steps` exporte les STL intermédiaires dans le répertoire de debug
 
 Notes:
 
 - Les SVG de résumé par étape sont générés automatiquement dans `debug_<svg>/` pendant la gravure; le résumé final est également écrit. Ces fichiers de debug ne sont conservés que si `--keep-debug-files` est fourni.
-- Les STL intermédiaires (par groupe et dalles) ne sont exportés que si `export_steps=True` (réglable via l’API, pas exposé en CLI pour l’instant).
+- Les STL intermédiaires (par groupe et dalles) sont exportés avec `--export-steps` ou `export_steps=True`.
 - Le STL de base (avant gravure) est toujours exporté dans le répertoire de debug, mais il n’est conservé que si `--keep-debug-files` est fourni.
+- Le CLI refuse les fichiers SVG ou répertoires de sortie inexistants et les paramètres géométriques invalides. Il ne crée jamais de SVG de remplacement.
+- Une gravure incomplète est considérée comme un échec : l'API lève `MoldGenerationError`, avec l'étape et, pour la gravure, le groupe SVG concernés, plutôt que d'exporter un moule partiellement gravé.
 
 ### Exemple de configuration de débogage VS Code
 
@@ -112,7 +116,7 @@ Notes:
 
 ## API Python (résumé)
 
-- `generate_cadquery_mold(svg_file, max_dim, base_thickness=..., border_height=..., border_thickness=..., engrave_depth=..., margin=..., export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False, keep_debug_files=False, engraving_mode="classic"|"stepped", layer_thickness_mm=0.1, pixel_size_mm=0.1, growth_per_layer_px=1)`
+- `generate_cadquery_mold(svg_file, max_dim, base_thickness=..., border_height=..., border_thickness=..., engrave_depth=..., margin=..., export_base_stl=True, base_stl_name="moule_base.stl", export_steps=False, keep_debug_files=False, engraving_mode="stepped", layer_thickness_mm=0.1, pixel_size_mm=0.1, growth_per_layer_px=1)`
   - Retourne `(mold_solid, engraved_indices, shape_history)`
   - Crée `debug_<svg>/`; si `keep_debug_files=False`, ce dossier est supprimé à la fin
   - Génère `step_<k>_summary.svg` à chaque étape + un `summary_<svg>_final.svg`
@@ -121,6 +125,7 @@ Notes:
   - `engraving_mode`:
     - `classic`: loft avec dépouille (15° par défaut), fallback extrusion
     - `stepped`: gravure par couches (0,1 mm par défaut), grille raster `pixel_size_mm` et croissance par couche `growth_per_layer_px`
+  - Lève `MoldGenerationError` en cas d'échec de normalisation, conversion, construction de base ou gravure ; l'exception conserve l'étape et le groupe en cause quand il y en a un.
 
 ## Tests
 
