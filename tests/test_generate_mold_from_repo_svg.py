@@ -12,7 +12,7 @@ except Exception:
 @unittest.skipUnless(CADQUERY_AVAILABLE, "CadQuery or pipeline not available in this environment")
 class TestGenerateMoldFromRepoSvg(unittest.TestCase):
     def test_generate_mold_default(self):
-        """Generate a mold for svgs/Anneaux_imbriqués_addition.svg using the default (classic) mode."""
+        """Generate a mold using the default voxelized mode with test-scale resolution."""
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         svg_path = os.path.join(repo_root, 'svgs', 'Anneaux_imbriqués_addition.svg')
         self.assertTrue(os.path.exists(svg_path), f"SVG introuvable: {svg_path}")
@@ -20,9 +20,12 @@ class TestGenerateMoldFromRepoSvg(unittest.TestCase):
         # Run mold generation with debug retention to inspect outputs if needed
         mold, engraved_indices, shape_history = generate_cadquery_mold(
             svg_path,
-            max_dim=100,
+            max_dim=50,
             export_steps=True,
             keep_debug_files=True,
+            layer_thickness_mm=0.2,
+            pixel_size_mm=0.2,
+            growth_per_layer_px=1,
         )
 
         self.assertIsNotNone(mold, "Le moule retourné est None")
